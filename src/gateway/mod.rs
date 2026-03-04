@@ -49,8 +49,17 @@ use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
-/// Request timeout (30s) — prevents slow-loris attacks
+/// Default request timeout (30s) — prevents slow-loris attacks.
+/// Override at runtime with `ZEROCLAW_GATEWAY_TIMEOUT_SECS` env var.
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Read gateway timeout from env, falling back to the compile-time default.
+pub fn gateway_timeout_secs() -> u64 {
+    std::env::var("ZEROCLAW_GATEWAY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(REQUEST_TIMEOUT_SECS)
+}
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
@@ -690,7 +699,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         }
     }
 
+    let effective_timeout = gateway_timeout_secs();
     println!("🦀 ZeroClaw Gateway listening on http://{display_addr}");
+    if effective_timeout != REQUEST_TIMEOUT_SECS {
+        println!("  ⏱  Request timeout: {effective_timeout}s (override via ZEROCLAW_GATEWAY_TIMEOUT_SECS)");
+    }
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
     }
@@ -876,7 +889,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(gateway_timeout_secs()),
         ))
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback));
@@ -2897,6 +2910,24 @@ mod tests {
     #[test]
     fn security_timeout_is_30_seconds() {
         assert_eq!(REQUEST_TIMEOUT_SECS, 30);
+    }
+
+    #[test]
+    fn gateway_timeout_reads_env_override() {
+        // Without env var, returns the default constant
+        std::env::remove_var("ZEROCLAW_GATEWAY_TIMEOUT_SECS");
+        assert_eq!(gateway_timeout_secs(), 30);
+
+        // With valid env var, returns the override
+        std::env::set_var("ZEROCLAW_GATEWAY_TIMEOUT_SECS", "120");
+        assert_eq!(gateway_timeout_secs(), 120);
+
+        // With invalid env var, falls back to default
+        std::env::set_var("ZEROCLAW_GATEWAY_TIMEOUT_SECS", "not_a_number");
+        assert_eq!(gateway_timeout_secs(), 30);
+
+        // Cleanup
+        std::env::remove_var("ZEROCLAW_GATEWAY_TIMEOUT_SECS");
     }
 
     #[test]
