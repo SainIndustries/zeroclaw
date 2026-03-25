@@ -41,6 +41,7 @@ impl HookHandler for UsageReporterHook {
     }
 
     async fn on_llm_output(&self, response: &ChatResponse) {
+        warn!("usage_reporter: on_llm_output fired, has_usage={}", response.usage.is_some());
         let usage = match &response.usage {
             Some(u) => u,
             None => return, // No usage data — skip
@@ -69,11 +70,11 @@ impl HookHandler for UsageReporterHook {
             }
         });
 
-        debug!(
+        warn!(
             tokens = total_tokens,
             input = input,
             output = output,
-            "Reporting LLM usage to cred-receiver"
+            "usage_reporter: posting LLM usage to cred-receiver"
         );
 
         // Fire-and-forget — don't block the agent loop
@@ -81,7 +82,7 @@ impl HookHandler for UsageReporterHook {
         tokio::spawn(async move {
             match client.post(&url).json(&payload).send().await {
                 Ok(resp) if resp.status().is_success() => {
-                    debug!("Usage reported: {} tokens", total_tokens);
+                    warn!("usage_reporter: reported {} tokens", total_tokens);
                 }
                 Ok(resp) => {
                     warn!(
