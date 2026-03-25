@@ -47,6 +47,9 @@ impl HookRunner {
         if config.builtin.session_memory {
             runner.register(Box::new(super::builtin::SessionMemoryHook));
         }
+        if config.builtin.usage_reporter {
+            runner.register(Box::new(super::builtin::UsageReporterHook::new()));
+        }
         Some(runner)
     }
 

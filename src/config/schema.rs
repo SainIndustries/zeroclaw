@@ -3245,6 +3245,9 @@ pub struct BuiltinHooksConfig {
     /// Enable the session-memory hook (persists session hints between turns).
     #[serde(default)]
     pub session_memory: bool,
+    /// Enable the usage-reporter hook (reports token usage to cred-receiver for billing).
+    #[serde(default)]
+    pub usage_reporter: bool,
 }
 
 // ── Plugin system ─────────────────────────────────────────────────────────────
