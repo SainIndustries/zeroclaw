@@ -995,6 +995,7 @@ pub(crate) async fn agent_turn(
     silent: bool,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    hooks: Option<&crate::hooks::HookRunner>,
 ) -> Result<String> {
     TOOL_LOOP_CANARY_TOKENS_ENABLED
         .scope(
@@ -1014,7 +1015,7 @@ pub(crate) async fn agent_turn(
                 max_tool_iterations,
                 None,
                 None,
-                None,
+                hooks,
                 &[],
             ),
         )
@@ -3565,6 +3566,8 @@ pub async fn process_message_with_session(
         ChatMessage::user(&enriched),
     ];
 
+    let configured_hooks_for_session = crate::hooks::create_runner_from_config(&config.hooks);
+
     let cost_enforcement_context =
         create_cost_enforcement_context(&config.cost, &config.workspace_dir);
     let hb_cfg = if config.agent.safety_heartbeat_interval > 0 {
@@ -3590,6 +3593,7 @@ pub async fn process_message_with_session(
                 true,
                 &config.multimodal,
                 config.agent.max_tool_iterations,
+                configured_hooks_for_session.as_deref(),
             ),
         ),
     )
