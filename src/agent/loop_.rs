@@ -1533,6 +1533,10 @@ pub async fn run_tool_call_loop(
             parse_issue_detected,
         ) = match chat_result {
             Ok(resp) => {
+                // Fire void hook after LLM response (usage reporting, etc.)
+                if let Some(hooks) = hooks {
+                    hooks.fire_llm_output(&resp).await;
+                }
                 let mut response_text = resp.text_or_empty().to_string();
                 let mut native_calls = resp.tool_calls;
                 let mut reasoning_content = resp.reasoning_content.clone();
@@ -1612,7 +1616,12 @@ pub async fn run_tool_call_loop(
                     };
 
                     let continuation_resp = match continuation_result {
-                        Ok(response) => response,
+                        Ok(response) => {
+                            if let Some(hooks) = hooks {
+                                hooks.fire_llm_output(&response).await;
+                            }
+                            response
+                        }
                         Err(error) => {
                             continuation_termination_reason = Some("provider_error");
                             continuation_error =
