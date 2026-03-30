@@ -655,7 +655,7 @@ impl BedrockProvider {
                             role: "assistant".to_string(),
                             content: blocks,
                         });
-                    } else {
+                    } else if !msg.content.trim().is_empty() {
                         converse_messages.push(ConverseMessage {
                             role: "assistant".to_string(),
                             content: vec![ContentBlock::Text(TextBlock {
@@ -663,6 +663,8 @@ impl BedrockProvider {
                             })],
                         });
                     }
+                    // Skip assistant messages with empty content — Bedrock rejects
+                    // ContentBlock objects where the text field is blank.
                 }
                 "tool" => {
                     let tool_result_msg = Self::parse_tool_result_message(&msg.content)
@@ -846,7 +848,7 @@ impl BedrockProvider {
             }));
         }
 
-        if blocks.is_empty() {
+        if blocks.is_empty() && !content.trim().is_empty() {
             blocks.push(ContentBlock::Text(TextBlock {
                 text: content.to_string(),
             }));
