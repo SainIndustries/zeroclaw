@@ -328,6 +328,13 @@ impl LeakDetector {
                 continue;
             }
 
+            // Skip tokens that appear inside known-safe URL contexts.
+            // Google Workspace IDs (spreadsheet IDs, doc IDs, etc.) are
+            // high-entropy alphanumeric strings that trigger false positives.
+            if is_token_in_safe_url(content, token) {
+                continue;
+            }
+
             let entropy = shannon_entropy(token.as_bytes());
             if entropy >= threshold {
                 flagged = true;
@@ -345,6 +352,36 @@ impl LeakDetector {
             patterns.push("High-entropy token (possible encoded secret)".to_string());
         }
     }
+}
+
+/// Known-safe URL domains whose path segments contain high-entropy IDs
+/// (e.g. Google Workspace document IDs) that are not secrets.
+const SAFE_URL_DOMAINS: &[&str] = &[
+    "docs.google.com",
+    "sheets.google.com",
+    "drive.google.com",
+    "slides.google.com",
+    "calendar.google.com",
+    "mail.google.com",
+    "meet.google.com",
+];
+
+/// Check if a high-entropy token appears inside a URL from a known-safe domain.
+fn is_token_in_safe_url(content: &str, token: &str) -> bool {
+    if let Some(token_pos) = content.find(token) {
+        // Look backward from the token to find a URL start
+        let before = &content[..token_pos];
+        for domain in SAFE_URL_DOMAINS {
+            if before.ends_with(&format!("https://{domain}/"))
+                || before.contains(&format!("https://{domain}/"))
+            {
+                // Verify the URL context: the token must be between the domain and
+                // a URL-ending character (space, newline, ), ], etc.)
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn extract_candidate_tokens(content: &str) -> Vec<&str> {

@@ -1262,6 +1262,12 @@ impl SecurityPolicy {
             if candidate.is_empty() || candidate.contains("://") {
                 return None;
             }
+            // Skip JSON objects/arrays — they contain data, not file paths.
+            // Commands like `gws sheets --json '{"values":[["d/dx","2x"]]}'`
+            // have `/` characters inside JSON that aren't path references.
+            if candidate.starts_with('{') || candidate.starts_with('[') {
+                return None;
+            }
             if looks_like_path(candidate) && !self.is_path_allowed(candidate) {
                 Some(candidate.to_string())
             } else {
