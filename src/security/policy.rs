@@ -450,6 +450,100 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
     false
 }
 
+/// Check whether a command contains unsafe (file-targeting) redirections.
+///
+/// Safe patterns that are allowed:
+///   - fd-to-fd redirects: `2>&1`, `N>&M` (no file access)
+///   - /dev/null targets: `>/dev/null`, `2>/dev/null`, `&>/dev/null`
+///
+/// Unsafe patterns that are blocked:
+///   - File output: `> file`, `>> file`, `2> file`
+///   - File input: `< file` (but not `<(` process substitution, handled elsewhere)
+fn has_unsafe_redirection(command: &str) -> bool {
+    // Strip safe redirection patterns from the command (outside quotes only),
+    // then check if any unquoted `>` or `<` remains.
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    // Match safe patterns:
+    //   N>&M        — fd-to-fd (e.g., 2>&1, 3>&2)
+    //   &>/dev/null — bash shorthand redirect-all to /dev/null
+    //   N>/dev/null — redirect fd N to /dev/null (e.g., >/dev/null, 2>/dev/null)
+    //   N>>/dev/null — append fd N to /dev/null
+    static SAFE_REDIRECT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\d*>&\d+|&>/?dev/?null|\d*>>?/?dev/?null").unwrap()
+    });
+
+    // Build a version of the command with only unquoted content, preserving positions.
+    // We replace quoted regions with spaces so the regex doesn't match inside strings.
+    let unquoted = command.to_string();
+    let chars: Vec<char> = command.chars().collect();
+    let mut mask = vec![false; chars.len()]; // true = inside quotes
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+
+    for (i, &ch) in chars.iter().enumerate() {
+        match quote {
+            QuoteState::Single => {
+                mask[i] = true;
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::Double => {
+                mask[i] = true;
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                match ch {
+                    '\'' => {
+                        mask[i] = true;
+                        quote = QuoteState::Single;
+                    }
+                    '"' => {
+                        mask[i] = true;
+                        quote = QuoteState::Double;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Replace quoted chars with spaces so regex won't match inside strings
+    let mut masked: Vec<u8> = unquoted.bytes().collect();
+    for (i, is_quoted) in mask.iter().enumerate() {
+        if *is_quoted && i < masked.len() {
+            masked[i] = b' ';
+        }
+    }
+    let masked_str = String::from_utf8_lossy(&masked);
+
+    // Remove safe redirections from the masked string
+    let cleaned = SAFE_REDIRECT.replace_all(&masked_str, "   ");
+
+    // Now check if any unquoted < or > remains in the cleaned string
+    cleaned.contains('>') || cleaned.contains('<')
+}
+
 /// Detect unquoted shell variable expansions like `$HOME`, `$1`, `$?`.
 ///
 /// Escaped dollars (`\$`) are ignored. Variables inside single quotes are
@@ -930,7 +1024,7 @@ impl SecurityPolicy {
             return Err("command contains disallowed shell expansion syntax".into());
         }
 
-        if contains_unquoted_char(command, '>') || contains_unquoted_char(command, '<') {
+        if has_unsafe_redirection(command) {
             return Err("command contains disallowed redirection syntax".into());
         }
 
