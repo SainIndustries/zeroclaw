@@ -527,6 +527,50 @@ fn strip_wrapping_quotes(token: &str) -> &str {
     token.trim_matches(|c| c == '"' || c == '\'')
 }
 
+/// Split a command string into tokens respecting shell quoting.
+/// Unlike `split_whitespace`, this keeps `'{"values":[["1/x"]]}'` as a single token.
+fn extract_shell_tokens(cmd: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    for ch in cmd.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            escaped = true;
+            current.push(ch);
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            current.push(ch);
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            current.push(ch);
+            continue;
+        }
+        if ch.is_whitespace() && !in_single && !in_double {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
 fn looks_like_path(candidate: &str) -> bool {
     candidate.starts_with('/')
         || candidate.starts_with("./")
@@ -1277,8 +1321,14 @@ impl SecurityPolicy {
 
         for segment in split_unquoted_segments(command) {
             let cmd_part = skip_env_assignments(&segment);
-            let mut words = cmd_part.split_whitespace();
-            let Some(executable) = words.next() else {
+
+            // Extract quote-aware tokens instead of naive whitespace splitting.
+            // This preserves quoted arguments (e.g. --json '{"values":[["1/x"]]}')
+            // as single tokens, preventing inner content like "1/x" from being
+            // mistaken for file paths.
+            let tokens = extract_shell_tokens(cmd_part.trim());
+            let mut iter = tokens.iter();
+            let Some(executable) = iter.next() else {
                 continue;
             };
 
@@ -1289,7 +1339,7 @@ impl SecurityPolicy {
                 }
             }
 
-            for token in words {
+            for token in iter {
                 let candidate = strip_wrapping_quotes(token).trim();
                 if candidate.is_empty() || candidate.contains("://") {
                     continue;
