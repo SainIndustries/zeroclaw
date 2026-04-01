@@ -184,6 +184,7 @@ impl Tool for ShellTool {
         match self.security.validate_command_execution(&command, approved) {
             Ok(_) => {}
             Err(reason) => {
+                tracing::warn!(command = %command, reason = %reason, "shell tool: command validation failed");
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -193,6 +194,7 @@ impl Tool for ShellTool {
         }
 
         if let Some(path) = self.security.forbidden_path_argument(&command) {
+            tracing::warn!(command = %command, blocked_path = %path, "shell tool: path blocked by security policy");
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -259,6 +261,14 @@ impl Tool for ShellTool {
                     );
                 }
 
+                if !output.status.success() {
+                    tracing::warn!(
+                        command = %command,
+                        exit_code = ?output.status.code(),
+                        stderr = %stderr.chars().take(500).collect::<String>(),
+                        "shell tool: command failed"
+                    );
+                }
                 Ok(ToolResult {
                     success: output.status.success(),
                     output: stdout,
