@@ -1031,27 +1031,36 @@ impl SecurityPolicy {
             return Err("readonly autonomy level blocks shell command execution".into());
         }
 
-        if command.contains('`')
-            || contains_unquoted_shell_variable_expansion(command)
-            || command.contains("<(")
-            || command.contains(">(")
-        {
-            return Err("command contains disallowed shell expansion syntax".into());
-        }
+        // In Full autonomy, shell expansion and redirection are allowed.
+        // The command allowlist + forbidden paths + container isolation provide
+        // sufficient protection. Blocking shell features prevents agents from
+        // writing multi-step scripts (variable assignment, command substitution)
+        // which are essential for complex workflows like GWS sheet creation.
+        if self.autonomy != AutonomyLevel::Full {
+            if command.contains('`')
+                || contains_unquoted_shell_variable_expansion(command)
+                || command.contains("<(")
+                || command.contains(">(")
+            {
+                return Err("command contains disallowed shell expansion syntax".into());
+            }
 
-        if has_unsafe_redirection(command) {
-            return Err("command contains disallowed redirection syntax".into());
-        }
+            if has_unsafe_redirection(command) {
+                return Err("command contains disallowed redirection syntax".into());
+            }
 
-        if command
-            .split_whitespace()
-            .any(|w| w == "tee" || w.ends_with("/tee"))
-        {
-            return Err("command contains disallowed tee usage".into());
-        }
+            if command
+                .split_whitespace()
+                .any(|w| w == "tee" || w.ends_with("/tee"))
+            {
+                return Err("command contains disallowed tee usage".into());
+            }
 
-        if contains_unquoted_single_ampersand(command) {
-            return Err("command contains disallowed background chaining operator '&'".into());
+            if contains_unquoted_single_ampersand(command) {
+                return Err(
+                    "command contains disallowed background chaining operator '&'".into(),
+                );
+            }
         }
 
         let segments = split_unquoted_segments(command);
