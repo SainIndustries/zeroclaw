@@ -354,31 +354,26 @@ impl LeakDetector {
     }
 }
 
-/// Known-safe URL domains whose path segments contain high-entropy IDs
-/// (e.g. Google Workspace document IDs) that are not secrets.
-const SAFE_URL_DOMAINS: &[&str] = &[
-    "docs.google.com",
-    "sheets.google.com",
-    "drive.google.com",
-    "slides.google.com",
-    "calendar.google.com",
-    "mail.google.com",
-    "meet.google.com",
+/// Known-safe URL domain fragments. Tokens extracted from content that
+/// contain these fragments are Google Workspace URLs, not secrets.
+/// The token extractor splits on `.` so a URL like
+/// `https://docs.google.com/spreadsheets/d/SHEET_ID/edit` produces a
+/// token like `com/spreadsheets/d/SHEET_ID/edit`.
+const SAFE_URL_FRAGMENTS: &[&str] = &[
+    "com/spreadsheets/",
+    "com/document/",
+    "com/presentation/",
+    "com/file/",
+    "com/drive/",
+    "com/calendar/",
+    "com/mail/",
 ];
 
-/// Check if a high-entropy token appears inside a URL from a known-safe domain.
-fn is_token_in_safe_url(content: &str, token: &str) -> bool {
-    if let Some(token_pos) = content.find(token) {
-        // Look backward from the token to find a URL start
-        let before = &content[..token_pos];
-        for domain in SAFE_URL_DOMAINS {
-            if before.ends_with(&format!("https://{domain}/"))
-                || before.contains(&format!("https://{domain}/"))
-            {
-                // Verify the URL context: the token must be between the domain and
-                // a URL-ending character (space, newline, ), ], etc.)
-                return true;
-            }
+/// Check if a high-entropy token is part of a known-safe Google URL.
+fn is_token_in_safe_url(_content: &str, token: &str) -> bool {
+    for fragment in SAFE_URL_FRAGMENTS {
+        if token.contains(fragment) {
+            return true;
         }
     }
     false
