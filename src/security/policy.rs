@@ -355,9 +355,11 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
 fn contains_unquoted_single_ampersand(command: &str) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
-    let mut chars = command.chars().peekable();
+    let chars_vec: Vec<char> = command.chars().collect();
+    let mut i = 0;
 
-    while let Some(ch) = chars.next() {
+    while i < chars_vec.len() {
+        let ch = chars_vec[i];
         match quote {
             QuoteState::Single => {
                 if ch == '\'' {
@@ -367,10 +369,12 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
             QuoteState::Double => {
                 if escaped {
                     escaped = false;
+                    i += 1;
                     continue;
                 }
                 if ch == '\\' {
                     escaped = true;
+                    i += 1;
                     continue;
                 }
                 if ch == '"' {
@@ -380,17 +384,27 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
             QuoteState::None => {
                 if escaped {
                     escaped = false;
+                    i += 1;
                     continue;
                 }
                 if ch == '\\' {
                     escaped = true;
+                    i += 1;
                     continue;
                 }
                 match ch {
                     '\'' => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
                     '&' => {
-                        if chars.next_if_eq(&'&').is_none() {
+                        let next = chars_vec.get(i + 1).copied();
+                        let prev = if i > 0 { Some(chars_vec[i - 1]) } else { None };
+                        if next == Some('&') {
+                            // && (logical AND) — allowed, skip both
+                            i += 1;
+                        } else if prev == Some('>') || next == Some('>') {
+                            // Part of redirect: N>&M or &>/dev/null — allowed
+                        } else {
+                            // Bare & (background operator) — blocked
                             return true;
                         }
                     }
@@ -398,6 +412,7 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
                 }
             }
         }
+        i += 1;
     }
 
     false
