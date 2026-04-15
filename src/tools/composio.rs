@@ -640,10 +640,6 @@ impl Tool for ComposioTool {
                     "type": "string",
                     "description": "Natural-language description of what you want the action to do (alternative to 'params' when you are unsure of the exact parameter names). Composio will resolve the correct parameters via NLP. Mutually exclusive with 'params'."
                 },
-                "entity_id": {
-                    "type": "string",
-                    "description": "Entity/user ID for multi-user setups (defaults to composio.entity_id from config)"
-                },
                 "auth_config_id": {
                     "type": "string",
                     "description": "Optional Composio v3 auth config id for connect flow"
@@ -663,10 +659,16 @@ impl Tool for ComposioTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'action' parameter"))?;
 
-        let entity_id = args
-            .get("entity_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(self.default_entity_id.as_str());
+        // Security (Fix #3): `entity_id` is intentionally NOT read from args.
+        // Always use the server-configured default entity (from `[composio]` config.toml).
+        // Prevents LLM-initiated privilege escalation via prompt-injected tool-call args.
+        if args.get("entity_id").is_some() {
+            tracing::warn!(
+                tool = "composio",
+                "Ignoring LLM-supplied entity_id; using server-configured default"
+            );
+        }
+        let entity_id = self.default_entity_id.as_str();
 
         match action {
             "list" => {
