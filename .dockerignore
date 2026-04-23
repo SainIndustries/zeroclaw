@@ -73,7 +73,6 @@ lcov.info
 # Note: apps/tauri/Cargo.toml is required for workspace resolution in Docker build.
 apps/*
 !apps/tauri/
-apps/tauri/src/
 apps/tauri/icons/
 apps/tauri/gen/
 apps/tauri/capabilities/
