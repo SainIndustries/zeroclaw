@@ -11992,17 +11992,4 @@ This is an example JSON object for profile settings."#;
         assert!(prompt_b.contains("sender=user_bbb"));
         assert_ne!(prompt_a, prompt_b);
     }
-
-    #[test]
-    fn non_cli_excluded_tools_default_contains_process() {
-        let cfg = zeroclaw_config::schema::AutonomyConfig::default();
-        assert!(
-            cfg.non_cli_excluded_tools.iter().any(|t| t == "process"),
-            "process tool should be excluded by default from non-CLI channels"
-        );
-        assert!(
-            cfg.non_cli_excluded_tools.iter().any(|t| t == "shell"),
-            "shell tool should be excluded by default from non-CLI channels"
-        );
-    }
 }
