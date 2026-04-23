@@ -101,7 +101,7 @@ pub async fn handle_chat_completions(
     let completion_id_fwd = completion_id.clone();
     let model_fwd = model.clone();
     let out_tx_fwd = out_tx.clone();
-    tokio::spawn(async move {
+    let forwarder = tokio::spawn(async move {
         // Emit role=assistant opener so clients know the stream has started.
         let _ = out_tx_fwd
             .send(SseFrame::Delta(build_chunk(
@@ -150,13 +150,18 @@ pub async fn handle_chat_completions(
             }
         };
 
-        // Run the agent turn, streaming events into evt_tx.
-        // We must not move agent into a separate spawn (it's &mut), so we
-        // drive both the turn and the event channel in a join — but the
-        // forwarder task above is already draining evt_rx concurrently, so
-        // we just await the turn here.  The channel backpressure ensures
-        // the forwarder keeps up.
+        // Run the agent turn, streaming events into evt_tx. The forwarder
+        // task above drains evt_rx concurrently. turn_streamed takes
+        // ownership of evt_tx and drops it on return, signalling the
+        // forwarder's while-let loop to exit once drained.
         let result = agent.turn_streamed(&user_message, evt_tx).await;
+
+        // Wait for the forwarder to fully drain queued TurnEvents into
+        // out_tx before we emit finish + [DONE]. Without this join, the
+        // terminal frames can arrive on the client before trailing content
+        // chunks, which violates the OpenAI SSE protocol (content after
+        // [DONE]).
+        let _ = forwarder.await;
 
         // Emit terminal finish_reason frame + [DONE] sentinel.
         let finish = match &result {
