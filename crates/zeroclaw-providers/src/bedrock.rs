@@ -15,6 +15,9 @@ use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::RwLock;
 use zeroclaw_api::tool::ToolSpec;
 
 /// Hostname prefix for the Bedrock Runtime endpoint.
@@ -203,6 +206,58 @@ impl AwsCredentials {
 
     fn host(&self) -> String {
         format!("{ENDPOINT_PREFIX}.{}.amazonaws.com", self.region)
+    }
+}
+
+/// How long cached credentials stay fresh before the next `get()` re-fetches.
+/// ECS STS session tokens typically expire after 6-12 hours; we refresh well
+/// before that so no signed request ever carries an expired token.
+const CREDENTIAL_TTL_SECS: u64 = 50 * 60;
+
+/// Thread-safe credential cache that auto-refreshes from the env → ECS →
+/// IMDS chain when the cached credentials are older than [`CREDENTIAL_TTL_SECS`].
+///
+/// Uses double-checked locking so concurrent `get()` calls during expiry
+/// produce at most one refresh.
+struct CachedCredentials {
+    inner: Arc<RwLock<Option<(AwsCredentials, Instant)>>>,
+}
+
+impl CachedCredentials {
+    /// Create a new cache, optionally pre-populated with seed credentials.
+    fn new(initial: Option<AwsCredentials>) -> Self {
+        let entry = initial.map(|c| (c, Instant::now()));
+        Self {
+            inner: Arc::new(RwLock::new(entry)),
+        }
+    }
+
+    /// Get current credentials, refreshing via `AwsCredentials::resolve()` if
+    /// the cache is empty or the entry is older than `CREDENTIAL_TTL_SECS`.
+    async fn get(&self) -> anyhow::Result<AwsCredentials> {
+        // Fast path: read lock, check freshness.
+        {
+            let guard = self.inner.read().await;
+            if let Some((ref creds, fetched_at)) = *guard {
+                if fetched_at.elapsed().as_secs() < CREDENTIAL_TTL_SECS {
+                    return Ok(creds.clone());
+                }
+            }
+        }
+
+        // Slow path: upgrade to write lock, re-check, then re-fetch.
+        let mut guard = self.inner.write().await;
+        if let Some((ref creds, fetched_at)) = *guard {
+            if fetched_at.elapsed().as_secs() < CREDENTIAL_TTL_SECS {
+                return Ok(creds.clone());
+            }
+        }
+
+        tracing::info!("Refreshing AWS credentials (cache empty or TTL expired)");
+        let fresh = AwsCredentials::resolve().await?;
+        let cloned = fresh.clone();
+        *guard = Some((fresh, Instant::now()));
+        Ok(cloned)
     }
 }
 
@@ -2014,5 +2069,20 @@ mod tests {
 
         let result = resolve_ecs_endpoint();
         assert_eq!(result, None);
+    }
+
+    // ── CachedCredentials tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn cached_credentials_returns_seeded_value_before_ttl() {
+        let seed = AwsCredentials {
+            access_key_id: "AKIA_seed".to_string(),
+            secret_access_key: "secret_seed".to_string(),
+            session_token: None,
+            region: "us-east-1".to_string(),
+        };
+        let cache = CachedCredentials::new(Some(seed.clone()));
+        let got = cache.get().await.expect("seeded get should succeed");
+        assert_eq!(got.access_key_id, "AKIA_seed");
     }
 }
