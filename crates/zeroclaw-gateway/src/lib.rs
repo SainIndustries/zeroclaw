@@ -18,6 +18,7 @@ pub mod canvas;
 pub mod hardware_context;
 pub mod node_tool;
 pub mod nodes;
+pub mod openai_compat;
 pub mod session_queue;
 pub mod sse;
 pub mod static_files;
