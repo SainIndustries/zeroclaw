@@ -5,11 +5,11 @@
 
 use crate::security::AutonomyLevel;
 use chrono::Utc;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
-use zeroclaw_config::schema::{AutonomyConfig, CommandContextRuleAction};
+use zeroclaw_config::schema::AutonomyConfig;
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -61,11 +61,6 @@ pub struct ApprovalManager {
     auto_approve: HashSet<String>,
     /// Tools that always need approval, ignoring session allowlist.
     always_ask: HashSet<String>,
-    /// Command patterns requiring approval even when a tool is auto-approved.
-    ///
-    /// Sourced from `autonomy.command_context_rules` entries where
-    /// `action = "require_approval"`.
-    command_level_require_approval_rules: RwLock<Vec<String>>,
     /// Autonomy level from config.
     autonomy_level: AutonomyLevel,
     /// When `true`, tools that would require interactive approval are
@@ -78,24 +73,11 @@ pub struct ApprovalManager {
 }
 
 impl ApprovalManager {
-    fn extract_command_level_approval_rules(config: &AutonomyConfig) -> Vec<String> {
-        config
-            .command_context_rules
-            .iter()
-            .filter(|rule| rule.action == CommandContextRuleAction::RequireApproval)
-            .map(|rule| rule.command.trim().to_string())
-            .filter(|command| !command.is_empty())
-            .collect()
-    }
-
     /// Create an interactive (CLI) approval manager from autonomy config.
     pub fn from_config(config: &AutonomyConfig) -> Self {
         Self {
             auto_approve: config.auto_approve.iter().cloned().collect(),
             always_ask: config.always_ask.iter().cloned().collect(),
-            command_level_require_approval_rules: RwLock::new(
-                Self::extract_command_level_approval_rules(config),
-            ),
             autonomy_level: config.level,
             non_interactive: false,
             session_allowlist: Mutex::new(HashSet::new()),
@@ -112,9 +94,6 @@ impl ApprovalManager {
         Self {
             auto_approve: config.auto_approve.iter().cloned().collect(),
             always_ask: config.always_ask.iter().cloned().collect(),
-            command_level_require_approval_rules: RwLock::new(
-                Self::extract_command_level_approval_rules(config),
-            ),
             autonomy_level: config.level,
             non_interactive: true,
             session_allowlist: Mutex::new(HashSet::new()),
@@ -169,33 +148,6 @@ impl ApprovalManager {
 
         // Default: supervised mode requires approval.
         true
-    }
-
-    /// Check whether a specific tool call (including arguments) needs interactive approval.
-    ///
-    /// This extends [`Self::needs_approval`] with command-level approval matching:
-    /// when a call carries a `command` argument that matches a
-    /// `command_context_rules[action=require_approval]` pattern, the call is
-    /// approval-gated in supervised mode even if the tool is in `auto_approve`.
-    pub fn needs_approval_for_call(&self, tool_name: &str, args: &serde_json::Value) -> bool {
-        if self.needs_approval(tool_name) {
-            return true;
-        }
-
-        if self.autonomy_level != AutonomyLevel::Supervised {
-            return false;
-        }
-
-        let rules = self.command_level_require_approval_rules.read();
-        if rules.is_empty() {
-            return false;
-        }
-
-        let Some(command) = extract_command_argument(args) else {
-            return false;
-        };
-
-        command_matches_require_approval_rules(&command, &rules)
     }
 
     /// Record an approval decision and update session state.
@@ -302,190 +254,6 @@ fn truncate_for_summary(input: &str, max_chars: usize) -> String {
     } else {
         input.to_string()
     }
-}
-
-// ── Command-level approval matching helpers ──────────────────────────────────
-
-fn extract_command_argument(args: &serde_json::Value) -> Option<String> {
-    for alias in ["command", "cmd", "shell_command", "bash", "sh", "input"] {
-        if let Some(command) = args
-            .get(alias)
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|cmd| !cmd.is_empty())
-        {
-            return Some(command.to_string());
-        }
-    }
-
-    args.as_str()
-        .map(str::trim)
-        .filter(|cmd| !cmd.is_empty())
-        .map(ToString::to_string)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QuoteState {
-    None,
-    Single,
-    Double,
-}
-
-fn split_unquoted_segments_for_approval(command: &str) -> Vec<String> {
-    let mut segments = Vec::new();
-    let mut current = String::new();
-    let mut quote = QuoteState::None;
-    let mut escaped = false;
-    let mut chars = command.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        match quote {
-            QuoteState::Single => {
-                if ch == '\'' {
-                    quote = QuoteState::None;
-                }
-                current.push(ch);
-            }
-            QuoteState::Double => {
-                if escaped {
-                    escaped = false;
-                    current.push(ch);
-                    continue;
-                }
-                if ch == '\\' {
-                    escaped = true;
-                    current.push(ch);
-                    continue;
-                }
-                if ch == '"' {
-                    quote = QuoteState::None;
-                }
-                current.push(ch);
-            }
-            QuoteState::None => {
-                if escaped {
-                    escaped = false;
-                    current.push(ch);
-                    continue;
-                }
-                if ch == '\\' {
-                    escaped = true;
-                    current.push(ch);
-                    continue;
-                }
-
-                match ch {
-                    '\'' => {
-                        quote = QuoteState::Single;
-                        current.push(ch);
-                    }
-                    '"' => {
-                        quote = QuoteState::Double;
-                        current.push(ch);
-                    }
-                    ';' | '\n' => {
-                        let trimmed = current.trim().to_string();
-                        if !trimmed.is_empty() {
-                            segments.push(trimmed);
-                        }
-                        current.clear();
-                    }
-                    '|' => {
-                        chars.next_if_eq(&'|');
-                        let trimmed = current.trim().to_string();
-                        if !trimmed.is_empty() {
-                            segments.push(trimmed);
-                        }
-                        current.clear();
-                    }
-                    '&' => {
-                        if chars.next_if_eq(&'&').is_some() {
-                            let trimmed = current.trim().to_string();
-                            if !trimmed.is_empty() {
-                                segments.push(trimmed);
-                            }
-                            current.clear();
-                        } else {
-                            current.push(ch);
-                        }
-                    }
-                    _ => current.push(ch),
-                }
-            }
-        }
-    }
-
-    let trimmed = current.trim().to_string();
-    if !trimmed.is_empty() {
-        segments.push(trimmed);
-    }
-
-    segments
-}
-
-fn skip_env_assignments_for_approval(s: &str) -> &str {
-    let mut rest = s;
-    loop {
-        let Some(word) = rest.split_whitespace().next() else {
-            return rest;
-        };
-        if word.contains('=')
-            && word
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        {
-            rest = rest[word.len()..].trim_start();
-        } else {
-            return rest;
-        }
-    }
-}
-
-fn strip_wrapping_quotes_approval(token: &str) -> &str {
-    let bytes = token.as_bytes();
-    if bytes.len() >= 2
-        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
-            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
-    {
-        &token[1..token.len() - 1]
-    } else {
-        token
-    }
-}
-
-fn command_rule_matches_approval(rule: &str, executable: &str, executable_base: &str) -> bool {
-    let normalized_rule = strip_wrapping_quotes_approval(rule).trim();
-    if normalized_rule.is_empty() {
-        return false;
-    }
-    if normalized_rule == "*" {
-        return true;
-    }
-    if normalized_rule.contains('/') {
-        strip_wrapping_quotes_approval(executable).trim() == normalized_rule
-    } else {
-        normalized_rule == executable_base
-    }
-}
-
-fn command_matches_require_approval_rules(command: &str, rules: &[String]) -> bool {
-    split_unquoted_segments_for_approval(command)
-        .into_iter()
-        .any(|segment| {
-            let cmd_part = skip_env_assignments_for_approval(&segment);
-            let mut words = cmd_part.split_whitespace();
-            let executable = strip_wrapping_quotes_approval(words.next().unwrap_or("")).trim();
-            let base_cmd = executable.rsplit('/').next().unwrap_or("").trim();
-
-            if base_cmd.is_empty() {
-                return false;
-            }
-
-            rules
-                .iter()
-                .any(|rule| command_rule_matches_approval(rule, executable, base_cmd))
-        })
 }
 
 // ── Tests ────────────────────────────────────────────────────────

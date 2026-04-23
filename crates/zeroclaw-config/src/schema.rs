@@ -5577,75 +5577,6 @@ impl Default for WebhookAuditConfig {
 /// Controls what the agent is allowed to do: shell commands, filesystem access,
 /// risk approval gates, and per-policy budgets.
 #[allow(clippy::struct_excessive_bools)]
-/// Action to apply when a command-context rule matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum CommandContextRuleAction {
-    /// Matching context is explicitly allowed.
-    #[default]
-    Allow,
-    /// Matching context is explicitly denied.
-    Deny,
-    /// Matching context requires interactive approval in supervised mode.
-    ///
-    /// This does not allow a command by itself; allowlist and deny checks still apply.
-    RequireApproval,
-}
-
-/// Context-aware command rule for shell commands.
-///
-/// Rules are evaluated per command segment. Command matching accepts command
-/// names (`curl`), explicit paths (`/usr/bin/curl`), and wildcard (`*`).
-///
-/// Matching semantics:
-/// - `action = "deny"`: if all constraints match, the segment is rejected.
-/// - `action = "allow"`: if at least one allow rule exists for a command,
-///   segments must match at least one of those allow rules.
-/// - `action = "require_approval"`: matching segments require explicit
-///   `approved=true` in supervised mode, even when `shell` is auto-approved.
-///
-/// Constraints are optional:
-/// - `allowed_domains`: require URL arguments to match these hosts/patterns.
-/// - `allowed_path_prefixes`: require path-like arguments to stay under these prefixes.
-/// - `denied_path_prefixes`: for deny rules, match when any path-like argument
-///   is under these prefixes; for allow rules, require path arguments not to hit
-///   these prefixes.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct CommandContextRuleConfig {
-    /// Command name/path pattern (`git`, `/usr/bin/curl`, or `*`).
-    pub command: String,
-
-    /// Rule action (`allow` | `deny` | `require_approval`). Defaults to `allow`.
-    #[serde(default)]
-    pub action: CommandContextRuleAction,
-
-    /// Allowed host patterns for URL arguments.
-    ///
-    /// Supports exact hosts (`api.example.com`) and wildcard suffixes (`*.example.com`).
-    #[serde(default)]
-    pub allowed_domains: Vec<String>,
-
-    /// Allowed path prefixes for path-like arguments.
-    ///
-    /// Prefixes may be absolute, `~/...`, or workspace-relative.
-    #[serde(default)]
-    pub allowed_path_prefixes: Vec<String>,
-
-    /// Denied path prefixes for path-like arguments.
-    ///
-    /// Prefixes may be absolute, `~/...`, or workspace-relative.
-    #[serde(default)]
-    pub denied_path_prefixes: Vec<String>,
-
-    /// Permit high-risk commands when this allow rule matches.
-    ///
-    /// The command still requires explicit `approved=true` in supervised mode.
-    #[serde(default)]
-    pub allow_high_risk: bool,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "autonomy"]
@@ -5658,14 +5589,6 @@ pub struct AutonomyConfig {
     pub workspace_only: bool,
     /// Allowlist of executable names permitted for shell execution.
     pub allowed_commands: Vec<String>,
-
-    /// Context-aware shell command allow/deny rules.
-    ///
-    /// These rules are evaluated per command segment and can narrow or override
-    /// global `allowed_commands` behavior for matching commands.
-    #[serde(default)]
-    pub command_context_rules: Vec<CommandContextRuleConfig>,
-
     /// Explicit path denylist. Default includes system-critical paths and sensitive dotdirs.
     pub forbidden_paths: Vec<String>,
     /// Maximum actions allowed per hour per policy. Default: `100`.
@@ -5819,7 +5742,6 @@ impl Default for AutonomyConfig {
                 "pip".into(),
                 "node".into(),
             ],
-            command_context_rules: Vec::new(),
             forbidden_paths: vec![
                 "/etc".into(),
                 "/root".into(),
@@ -10132,59 +10054,6 @@ impl Config {
                 anyhow::bail!(
                     "autonomy.shell_env_passthrough[{i}] is invalid ({env_name}); expected [A-Za-z_][A-Za-z0-9_]*"
                 );
-            }
-        }
-        for (i, rule) in self.autonomy.command_context_rules.iter().enumerate() {
-            let command = rule.command.trim();
-            if command.is_empty() {
-                anyhow::bail!("autonomy.command_context_rules[{i}].command must not be empty");
-            }
-            if !command
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '.' | '*'))
-            {
-                anyhow::bail!(
-                    "autonomy.command_context_rules[{i}].command contains invalid characters: {command}"
-                );
-            }
-            for (j, domain) in rule.allowed_domains.iter().enumerate() {
-                let normalized = domain.trim();
-                if normalized.is_empty() {
-                    anyhow::bail!(
-                        "autonomy.command_context_rules[{i}].allowed_domains[{j}] must not be empty"
-                    );
-                }
-                if normalized.chars().any(char::is_whitespace) {
-                    anyhow::bail!(
-                        "autonomy.command_context_rules[{i}].allowed_domains[{j}] must not contain whitespace"
-                    );
-                }
-            }
-            for (j, prefix) in rule.allowed_path_prefixes.iter().enumerate() {
-                let normalized = prefix.trim();
-                if normalized.is_empty() {
-                    anyhow::bail!(
-                        "autonomy.command_context_rules[{i}].allowed_path_prefixes[{j}] must not be empty"
-                    );
-                }
-                if normalized.contains('\0') {
-                    anyhow::bail!(
-                        "autonomy.command_context_rules[{i}].allowed_path_prefixes[{j}] must not contain null bytes"
-                    );
-                }
-            }
-            for (j, prefix) in rule.denied_path_prefixes.iter().enumerate() {
-                let normalized = prefix.trim();
-                if normalized.is_empty() {
-                    anyhow::bail!(
-                        "autonomy.command_context_rules[{i}].denied_path_prefixes[{j}] must not be empty"
-                    );
-                }
-                if normalized.contains('\0') {
-                    anyhow::bail!(
-                        "autonomy.command_context_rules[{i}].denied_path_prefixes[{j}] must not contain null bytes"
-                    );
-                }
             }
         }
 

@@ -148,9 +148,7 @@ pub fn should_execute_tools_in_parallel(
     }
 
     if let Some(mgr) = approval
-        && tool_calls
-            .iter()
-            .any(|call| mgr.needs_approval_for_call(&call.name, &call.arguments))
+        && tool_calls.iter().any(|call| mgr.needs_approval(&call.name))
     {
         // Approval-gated calls must keep sequential handling so the caller can
         // enforce CLI prompt/deny policy consistently.

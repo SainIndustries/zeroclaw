@@ -1,5 +1,4 @@
 use parking_lot::Mutex;
-use reqwest::Url;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -20,25 +19,6 @@ pub enum CommandRiskLevel {
 pub enum ToolOperation {
     Read,
     Act,
-}
-
-/// Action applied when a command context rule matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandContextRuleAction {
-    Allow,
-    Deny,
-    RequireApproval,
-}
-
-/// Context-aware allow/deny rule for shell commands.
-#[derive(Debug, Clone)]
-pub struct CommandContextRule {
-    pub command: String,
-    pub action: CommandContextRuleAction,
-    pub allowed_domains: Vec<String>,
-    pub allowed_path_prefixes: Vec<String>,
-    pub denied_path_prefixes: Vec<String>,
-    pub allow_high_risk: bool,
 }
 
 /// Sliding-window action tracker for rate limiting.
@@ -188,7 +168,6 @@ pub struct SecurityPolicy {
     pub workspace_dir: PathBuf,
     pub workspace_only: bool,
     pub allowed_commands: Vec<String>,
-    pub command_context_rules: Vec<CommandContextRule>,
     pub forbidden_paths: Vec<String>,
     pub allowed_roots: Vec<PathBuf>,
     pub max_actions_per_hour: u32,
@@ -322,7 +301,6 @@ impl Default for SecurityPolicy {
             workspace_dir: PathBuf::from("."),
             workspace_only: true,
             allowed_commands: default_allowed_commands(),
-            command_context_rules: Vec::new(),
             forbidden_paths: default_forbidden_paths(),
             allowed_roots: Vec::new(),
             max_actions_per_hour: 20,
@@ -858,320 +836,7 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
     false
 }
 
-// ── Context rule evaluation helpers ──────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SegmentRuleDecision {
-    NoMatch,
-    Allow,
-    Deny,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SegmentRuleOutcome {
-    decision: SegmentRuleDecision,
-    allow_high_risk: bool,
-    requires_approval: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct CommandAllowlistEvaluation {
-    high_risk_overridden: bool,
-    requires_explicit_approval: bool,
-}
-
 impl SecurityPolicy {
-    fn path_matches_rule_prefix(&self, candidate: &str, prefix: &str) -> bool {
-        let candidate_path = expand_user_path(candidate);
-        let prefix_path = expand_user_path(prefix);
-
-        let normalized_candidate = if candidate_path.is_absolute() {
-            candidate_path
-        } else {
-            self.workspace_dir.join(candidate_path)
-        };
-        let normalized_prefix = if prefix_path.is_absolute() {
-            prefix_path
-        } else {
-            self.workspace_dir.join(prefix_path)
-        };
-
-        normalized_candidate.starts_with(&normalized_prefix)
-    }
-
-    fn host_matches_pattern(host: &str, pattern: &str) -> bool {
-        let host = host.trim().to_ascii_lowercase();
-        let pattern = pattern.trim().to_ascii_lowercase();
-        if host.is_empty() || pattern.is_empty() {
-            return false;
-        }
-
-        if let Some(suffix) = pattern.strip_prefix("*.") {
-            host == suffix || host.ends_with(&format!(".{suffix}"))
-        } else {
-            host == pattern
-        }
-    }
-
-    fn extract_segment_url_hosts(args: &[&str]) -> Vec<String> {
-        args.iter()
-            .filter_map(|token| {
-                let candidate = strip_wrapping_quotes(token)
-                    .trim()
-                    .trim_matches(|c: char| matches!(c, ',' | ';'));
-                if candidate.is_empty() {
-                    return None;
-                }
-                Url::parse(candidate)
-                    .ok()
-                    .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-            })
-            .collect()
-    }
-
-    fn extract_segment_path_args(args: &[&str]) -> Vec<String> {
-        let mut paths = Vec::new();
-
-        for token in args {
-            let candidate = strip_wrapping_quotes(token).trim();
-            if candidate.is_empty() || candidate.contains("://") {
-                continue;
-            }
-
-            if let Some(target) = redirection_target(candidate) {
-                let normalized = strip_wrapping_quotes(target).trim();
-                if !normalized.is_empty() && looks_like_path(normalized) {
-                    paths.push(normalized.to_string());
-                }
-            }
-
-            if candidate.starts_with('-') {
-                if let Some((_, value)) = candidate.split_once('=') {
-                    let normalized = strip_wrapping_quotes(value).trim();
-                    if !normalized.is_empty()
-                        && !normalized.contains("://")
-                        && looks_like_path(normalized)
-                    {
-                        paths.push(normalized.to_string());
-                    }
-                }
-
-                if let Some(value) = attached_short_option_value(candidate) {
-                    let normalized = strip_wrapping_quotes(value).trim();
-                    if !normalized.is_empty()
-                        && !normalized.contains("://")
-                        && looks_like_path(normalized)
-                    {
-                        paths.push(normalized.to_string());
-                    }
-                }
-
-                continue;
-            }
-
-            if looks_like_path(candidate) {
-                paths.push(candidate.to_string());
-            }
-        }
-
-        paths
-    }
-
-    fn rule_conditions_match(&self, rule: &CommandContextRule, args: &[&str]) -> bool {
-        if !rule.allowed_domains.is_empty() {
-            let hosts = Self::extract_segment_url_hosts(args);
-            if hosts.is_empty() {
-                return false;
-            }
-            if !hosts.iter().all(|host| {
-                rule.allowed_domains
-                    .iter()
-                    .any(|pattern| Self::host_matches_pattern(host, pattern))
-            }) {
-                return false;
-            }
-        }
-
-        let path_args =
-            if rule.allowed_path_prefixes.is_empty() && rule.denied_path_prefixes.is_empty() {
-                Vec::new()
-            } else {
-                Self::extract_segment_path_args(args)
-            };
-
-        if !rule.allowed_path_prefixes.is_empty() {
-            if path_args.is_empty() {
-                return false;
-            }
-            if !path_args.iter().all(|path| {
-                rule.allowed_path_prefixes
-                    .iter()
-                    .any(|prefix| self.path_matches_rule_prefix(path, prefix))
-            }) {
-                return false;
-            }
-        }
-
-        if !rule.denied_path_prefixes.is_empty() {
-            if path_args.is_empty() {
-                return false;
-            }
-            let has_denied_path = path_args.iter().any(|path| {
-                rule.denied_path_prefixes
-                    .iter()
-                    .any(|prefix| self.path_matches_rule_prefix(path, prefix))
-            });
-            match rule.action {
-                CommandContextRuleAction::Allow | CommandContextRuleAction::RequireApproval => {
-                    if has_denied_path {
-                        return false;
-                    }
-                }
-                CommandContextRuleAction::Deny => {
-                    if !has_denied_path {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        true
-    }
-
-    fn evaluate_segment_context_rules(
-        &self,
-        executable: &str,
-        base_cmd: &str,
-        args: &[&str],
-    ) -> SegmentRuleOutcome {
-        let mut has_allow_rules = false;
-        let mut allow_match = false;
-        let mut allow_high_risk = false;
-        let mut requires_approval = false;
-
-        for rule in &self.command_context_rules {
-            if !is_allowlist_entry_match(&rule.command, executable, base_cmd) {
-                continue;
-            }
-
-            if matches!(rule.action, CommandContextRuleAction::Allow) {
-                has_allow_rules = true;
-            }
-
-            if !self.rule_conditions_match(rule, args) {
-                continue;
-            }
-
-            match rule.action {
-                CommandContextRuleAction::Deny => {
-                    return SegmentRuleOutcome {
-                        decision: SegmentRuleDecision::Deny,
-                        allow_high_risk: false,
-                        requires_approval: false,
-                    };
-                }
-                CommandContextRuleAction::Allow => {
-                    allow_match = true;
-                    allow_high_risk |= rule.allow_high_risk;
-                }
-                CommandContextRuleAction::RequireApproval => {
-                    requires_approval = true;
-                }
-            }
-        }
-
-        if has_allow_rules {
-            if allow_match {
-                SegmentRuleOutcome {
-                    decision: SegmentRuleDecision::Allow,
-                    allow_high_risk,
-                    requires_approval,
-                }
-            } else {
-                SegmentRuleOutcome {
-                    decision: SegmentRuleDecision::Deny,
-                    allow_high_risk: false,
-                    requires_approval: false,
-                }
-            }
-        } else {
-            SegmentRuleOutcome {
-                decision: SegmentRuleDecision::NoMatch,
-                allow_high_risk: false,
-                requires_approval,
-            }
-        }
-    }
-
-    /// Evaluate full command allowlist (multi-segment) with context rules.
-    fn evaluate_command_allowlist(&self, command: &str) -> Result<CommandAllowlistEvaluation, String> {
-        let mut has_cmd = false;
-        let mut saw_high_risk_segment = false;
-        let mut all_high_risk_segments_overridden = true;
-        let mut requires_explicit_approval = false;
-
-        for segment in &split_unquoted_segments(command) {
-            let cmd_part = skip_env_assignments(segment);
-            let mut words = cmd_part.split_whitespace();
-            let executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-            let base_cmd = command_basename(executable).trim();
-
-            if base_cmd.is_empty() {
-                continue;
-            }
-            has_cmd = true;
-
-            let args: Vec<&str> = words.collect();
-            let context_outcome = self.evaluate_segment_context_rules(executable, base_cmd, &args);
-
-            if context_outcome.decision == SegmentRuleDecision::Deny {
-                return Err(format!("context rule denied command segment `{base_cmd}`"));
-            }
-            requires_explicit_approval |= context_outcome.requires_approval;
-
-            if context_outcome.decision != SegmentRuleDecision::Allow
-                && !self
-                    .allowed_commands
-                    .iter()
-                    .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
-            {
-                return Err(format!("Command not allowed by security policy: {base_cmd}"));
-            }
-
-            // Track whether this segment is a high-risk command and whether
-            // its risk has been overridden by an allow rule.
-            let is_segment_high_risk = matches!(
-                base_cmd,
-                "rm" | "mkfs" | "dd" | "shutdown" | "reboot" | "halt" | "poweroff"
-                    | "sudo" | "su" | "chown" | "chmod" | "useradd" | "userdel" | "usermod"
-                    | "passwd" | "mount" | "umount" | "iptables" | "ufw" | "firewall-cmd"
-                    | "curl" | "wget" | "nc" | "ncat" | "netcat" | "scp" | "ssh" | "ftp"
-                    | "telnet" | "del" | "rmdir" | "format" | "reg"
-            );
-            if is_segment_high_risk {
-                saw_high_risk_segment = true;
-                if !context_outcome.allow_high_risk {
-                    all_high_risk_segments_overridden = false;
-                }
-            }
-
-            // Validate arguments safety
-            let args_lowercase: Vec<String> = args.iter().map(|w| w.to_ascii_lowercase()).collect();
-            if !self.is_args_safe(base_cmd, &args_lowercase) {
-                return Err(format!("Command not allowed by security policy: {base_cmd}"));
-            }
-        }
-
-        if !has_cmd {
-            return Err("Empty command".into());
-        }
-
-        Ok(CommandAllowlistEvaluation {
-            high_risk_overridden: saw_high_risk_segment && all_high_risk_segments_overridden,
-            requires_explicit_approval,
-        })
-    }
-
     // ── Risk Classification ──────────────────────────────────────────────
     // Risk is assessed per-segment (split on shell operators), and the
     // highest risk across all segments wins. This prevents bypasses like
@@ -1318,14 +983,9 @@ impl SecurityPolicy {
         command: &str,
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
-        let allowlist_eval = self.evaluate_command_allowlist(command).map_err(|e| {
-            // Wrap with full command for context
-            if e.starts_with("context rule denied") || e.starts_with("Empty command") {
-                e
-            } else {
-                format!("Command not allowed by security policy: {command}")
-            }
-        })?;
+        if !self.is_command_allowed(command) {
+            return Err(format!("Command not allowed by security policy: {command}"));
+        }
 
         let risk = self.command_risk_level(command);
 
@@ -1339,10 +999,7 @@ impl SecurityPolicy {
         }
 
         if risk == CommandRiskLevel::High {
-            if self.block_high_risk_commands
-                && !allowlist_eval.high_risk_overridden
-                && !self.is_command_explicitly_allowed(command)
-            {
+            if self.block_high_risk_commands && !self.is_command_explicitly_allowed(command) {
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
             }
             if self.autonomy == AutonomyLevel::Supervised && !approved {
@@ -1351,16 +1008,6 @@ impl SecurityPolicy {
                         .into(),
                 );
             }
-        }
-
-        if self.autonomy == AutonomyLevel::Supervised
-            && allowlist_eval.requires_explicit_approval
-            && !approved
-        {
-            return Err(
-                "Command requires explicit approval (approved=true): matched command_context_rules action=require_approval"
-                    .into(),
-            );
         }
 
         if risk == CommandRiskLevel::Medium
@@ -1484,9 +1131,49 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Use evaluate_command_allowlist which integrates context rules.
-        // This handles both the per-segment allowlist check and context rule evaluation.
-        self.evaluate_command_allowlist(command).is_ok()
+        // Split on unquoted command separators and validate each sub-command.
+        let segments = split_unquoted_segments(command);
+        for segment in &segments {
+            // Strip leading env var assignments (e.g. FOO=bar cmd)
+            let cmd_part = skip_env_assignments(segment);
+
+            let mut words = cmd_part.split_whitespace();
+            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            // Strip inline redirections from the executable token, e.g.
+            // `cat</dev/null` -> `cat`, so the allowlist check sees the real
+            // command name rather than the redirect target path.
+            let executable = if let Some(idx) = raw_executable.find(['<', '>']) {
+                &raw_executable[..idx]
+            } else {
+                raw_executable
+            };
+            let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
+            let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
+
+            if base_cmd.is_empty() {
+                continue;
+            }
+
+            if !self
+                .allowed_commands
+                .iter()
+                .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
+            {
+                return false;
+            }
+
+            // Validate arguments for the command
+            let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
+            if !self.is_args_safe(base_cmd, &args) {
+                return false;
+            }
+        }
+
+        // At least one command must be present
+        segments.iter().any(|s| {
+            let s = skip_env_assignments(s.trim());
+            s.split_whitespace().next().is_some_and(|w| !w.is_empty())
+        })
     }
 
     /// Check for dangerous arguments that allow sub-command execution or
@@ -1903,28 +1590,6 @@ impl SecurityPolicy {
             workspace_dir: workspace_dir.to_path_buf(),
             workspace_only: effective_workspace_only,
             allowed_commands: autonomy_config.allowed_commands.clone(),
-            command_context_rules: autonomy_config
-                .command_context_rules
-                .iter()
-                .map(|rule| CommandContextRule {
-                    command: rule.command.clone(),
-                    action: match rule.action {
-                        crate::schema::CommandContextRuleAction::Allow => {
-                            CommandContextRuleAction::Allow
-                        }
-                        crate::schema::CommandContextRuleAction::Deny => {
-                            CommandContextRuleAction::Deny
-                        }
-                        crate::schema::CommandContextRuleAction::RequireApproval => {
-                            CommandContextRuleAction::RequireApproval
-                        }
-                    },
-                    allowed_domains: rule.allowed_domains.clone(),
-                    allowed_path_prefixes: rule.allowed_path_prefixes.clone(),
-                    denied_path_prefixes: rule.denied_path_prefixes.clone(),
-                    allow_high_risk: rule.allow_high_risk,
-                })
-                .collect(),
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
             allowed_roots: autonomy_config
                 .allowed_roots
