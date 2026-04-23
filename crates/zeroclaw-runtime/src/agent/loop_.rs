@@ -1580,7 +1580,7 @@ pub async fn run_tool_call_loop(
 
             // ── Approval hook ────────────────────────────────
             if let Some(mgr) = approval
-                && mgr.needs_approval(&tool_name)
+                && mgr.needs_approval_for_call(&tool_name, &tool_args)
             {
                 let request = ApprovalRequest {
                     tool_name: tool_name.clone(),
@@ -1627,6 +1627,24 @@ pub async fn run_tool_call_loop(
                 };
 
                 mgr.record_decision(&tool_name, &tool_args, decision, channel_name);
+
+                if matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always) {
+                    match &mut tool_args {
+                        serde_json::Value::Object(map) => {
+                            map.insert("approved".to_string(), serde_json::Value::Bool(true));
+                        }
+                        serde_json::Value::String(command) => {
+                            let normalized_command = command.trim().to_string();
+                            if !normalized_command.is_empty() {
+                                tool_args = serde_json::json!({
+                                    "command": normalized_command,
+                                    "approved": true
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
 
                 if decision == ApprovalResponse::No {
                     let denied = "Denied by user.".to_string();
