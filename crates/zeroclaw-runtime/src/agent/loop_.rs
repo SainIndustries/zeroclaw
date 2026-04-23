@@ -77,9 +77,6 @@ pub use super::history::{
     load_interactive_session_history, save_interactive_session_history, trim_history,
     truncate_tool_result,
 };
-use super::history::{
-    extract_facts_from_turns, flush_durable_facts, TurnBuffer,
-};
 
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
@@ -2612,19 +2609,6 @@ pub async fn run(
         final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
-
-        // ── Post-turn fact extraction (single-message mode) ────────
-        if config.memory.auto_save {
-            let turns = vec![(msg.clone(), response.clone())];
-            let _ = extract_facts_from_turns(
-                provider.as_ref(),
-                &model_name,
-                &turns,
-                mem.as_ref(),
-                memory_session_id.as_deref(),
-            )
-            .await;
-        }
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
         println!("Type /help for commands.\n");
@@ -2640,9 +2624,6 @@ pub async fn run(
             vec![ChatMessage::system(&system_prompt)]
         };
 
-        // Turn buffer for periodic post-turn fact extraction.
-        let mut turn_buffer = TurnBuffer::new();
-
         loop {
             print!("> ");
             let _ = std::io::stdout().flush();
@@ -2651,27 +2632,8 @@ pub async fn run(
             // transport splits multi-byte characters at frame boundaries
             // (e.g. CJK input with spaces over kubectl exec / SSH).
             let mut raw = Vec::new();
-            // Read input — drop the stdin lock guard before any `.await` to satisfy Send.
-                let read_result = {
-                    let mut stdin = std::io::stdin().lock();
-                    std::io::BufRead::read_until(&mut stdin, b'\n', &mut raw)
-                };
-                match read_result {
-                Ok(0) => {
-                    // EOF — flush any remaining buffered turns before exit.
-                    if config.memory.auto_save && !turn_buffer.is_empty() {
-                        let turns = turn_buffer.drain_for_extraction();
-                        let _ = extract_facts_from_turns(
-                            provider.as_ref(),
-                            &model_name,
-                            &turns,
-                            mem.as_ref(),
-                            memory_session_id.as_deref(),
-                        )
-                        .await;
-                    }
-                    break;
-                }
+            match std::io::BufRead::read_until(&mut std::io::stdin().lock(), b'\n', &mut raw) {
+                Ok(0) => break,
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("\nError reading input: {e}\n");
@@ -2685,21 +2647,7 @@ pub async fn run(
                 continue;
             }
             match user_input.as_str() {
-                "/quit" | "/exit" => {
-                    // Flush any remaining buffered turns before exit.
-                    if config.memory.auto_save && !turn_buffer.is_empty() {
-                        let turns = turn_buffer.drain_for_extraction();
-                        let _ = extract_facts_from_turns(
-                            provider.as_ref(),
-                            &model_name,
-                            &turns,
-                            mem.as_ref(),
-                            memory_session_id.as_deref(),
-                        )
-                        .await;
-                    }
-                    break;
-                }
+                "/quit" | "/exit" => break,
                 "/help" => {
                     println!("Available commands:");
                     println!("  /help             Show this help message");
@@ -2754,8 +2702,6 @@ pub async fn run(
                     if let Some(path) = session_state_file.as_deref() {
                         save_interactive_session_history(path, &history)?;
                     }
-                    // Reset turn buffer when conversation is cleared.
-                    turn_buffer = TurnBuffer::new();
                     continue;
                 }
                 _ => {}
@@ -3010,68 +2956,8 @@ pub async fn run(
             }
             observer.record_event(&ObserverEvent::TurnComplete);
 
-            // ── Post-turn fact extraction ────────────────────────────
-            if config.memory.auto_save {
-                turn_buffer.push(&user_input, &response);
-                if turn_buffer.should_extract() {
-                    let turns = turn_buffer.drain_for_extraction();
-                    let result = extract_facts_from_turns(
-                        provider.as_ref(),
-                        &model_name,
-                        &turns,
-                        mem.as_ref(),
-                        memory_session_id.as_deref(),
-                    )
-                    .await;
-                    if result.stored > 0 || result.no_facts {
-                        turn_buffer.mark_extract_success();
-                    }
-                }
-            }
-
-            // ── Pre-compaction flush when post-turn extraction hasn't covered recent turns ──
-            // post_turn_active is true when auto_save is on AND the turn buffer confirms
-            // recent extraction succeeded; otherwise compaction flushes facts itself.
-            let post_turn_active =
-                config.memory.auto_save && !turn_buffer.needs_compaction_fallback();
-
             // Context compression before hard trimming to preserve long-context signal.
             {
-                // Pre-compaction flush: if post-turn extraction hasn't covered these turns,
-                // flush durable facts before the compressor discards old messages.
-                if !post_turn_active && config.memory.auto_save {
-                    // Build transcript from REPL history for flush (minus system message).
-                    let transcript_msgs: Vec<_> = history.iter()
-                        .filter(|m| m.role != "system")
-                        .cloned()
-                        .collect();
-                    if !transcript_msgs.is_empty() {
-                        let mut transcript = String::new();
-                        for msg in &transcript_msgs {
-                            let role = msg.role.to_uppercase();
-                            let _ = std::fmt::Write::write_fmt(
-                                &mut transcript,
-                                format_args!("{role}: {}\n", msg.content.trim()),
-                            );
-                        }
-                        let flush_ok = flush_durable_facts(
-                            provider.as_ref(),
-                            &model_name,
-                            &transcript,
-                            mem.as_ref(),
-                            memory_session_id.as_deref(),
-                        )
-                        .await;
-                        // Drain buffered turns to prevent duplicate extraction on next compaction.
-                        if !turn_buffer.is_empty() {
-                            let _ = turn_buffer.drain_for_extraction();
-                        }
-                        if flush_ok {
-                            turn_buffer.mark_extract_success();
-                        }
-                    }
-                }
-
                 let compressor = crate::agent::context_compressor::ContextCompressor::new(
                     config.agent.context_compression.clone(),
                     config.agent.max_context_tokens,
@@ -3460,7 +3346,7 @@ pub async fn process_message(
         excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
     }
 
-    let response = agent_turn(
+    agent_turn(
         provider.as_ref(),
         &mut history,
         &tools_registry,
@@ -3480,22 +3366,7 @@ pub async fn process_message(
         None,
         None, // channel: process_message path has no channel ref
     )
-    .await?;
-
-    // ── Post-turn fact extraction (process_message / single-message-with-session) ──
-    if config.memory.auto_save {
-        let turns = vec![(message.to_owned(), response.clone())];
-        let _ = extract_facts_from_turns(
-            provider.as_ref(),
-            &model_name,
-            &turns,
-            mem.as_ref(),
-            session_id,
-        )
-        .await;
-    }
-
-    Ok(response)
+    .await
 }
 
 #[cfg(test)]
