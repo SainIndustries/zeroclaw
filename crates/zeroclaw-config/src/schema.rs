@@ -7961,7 +7961,7 @@ impl ChannelConfig for FeishuConfig {
 // ── Security Config ─────────────────────────────────────────────────
 
 /// Security configuration for sandboxing, resource limits, and audit logging
-#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security"]
 pub struct SecurityConfig {
@@ -7999,6 +7999,25 @@ pub struct SecurityConfig {
     #[serde(default)]
     #[nested]
     pub webauthn: WebAuthnConfig,
+
+    /// Enable per-turn canary tokens to detect system-context exfiltration.
+    #[serde(default = "default_true")]
+    pub canary_tokens: bool,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            sandbox: SandboxConfig::default(),
+            resources: ResourceLimitsConfig::default(),
+            audit: AuditConfig::default(),
+            otp: OtpConfig::default(),
+            estop: EstopConfig::default(),
+            nevis: NevisConfig::default(),
+            webauthn: WebAuthnConfig::default(),
+            canary_tokens: true,
+        }
+    }
 }
 
 /// WebAuthn / FIDO2 hardware key authentication configuration (`[security.webauthn]`).

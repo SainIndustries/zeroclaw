@@ -91,6 +91,7 @@ use zeroclaw_providers::{self, ChatMessage, Provider};
 use zeroclaw_runtime::agent::loop_::{
     build_tool_instructions, clear_model_switch_request, get_model_switch_state,
     is_model_switch_requested, run_tool_call_loop, scope_thread_id, scrub_credentials,
+    TOOL_LOOP_CANARY_TOKENS_ENABLED,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -272,6 +273,15 @@ struct ChannelRuntimeDefaults {
     api_key: Option<String>,
     api_url: Option<String>,
     reliability: zeroclaw_config::schema::ReliabilityConfig,
+    // Hot-reload fields: read from snapshot per-message so config file
+    // changes take effect immediately without a restart.
+    auto_save_memory: bool,
+    max_tool_iterations: usize,
+    min_relevance_score: f64,
+    message_timeout_secs: u64,
+    multimodal: zeroclaw_config::schema::MultimodalConfig,
+    query_classification: zeroclaw_config::schema::QueryClassificationConfig,
+    model_routes: Vec<zeroclaw_config::schema::ModelRouteConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -842,6 +852,15 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
             .fallback_provider()
             .and_then(|e| e.base_url.clone()),
         reliability: config.reliability.clone(),
+        auto_save_memory: config.memory.auto_save,
+        max_tool_iterations: config.agent.max_tool_iterations,
+        min_relevance_score: config.memory.min_relevance_score,
+        message_timeout_secs: effective_channel_message_timeout_secs(
+            config.channels_config.message_timeout_secs,
+        ),
+        multimodal: config.multimodal.clone(),
+        query_classification: config.query_classification.clone(),
+        model_routes: config.model_routes.clone(),
     }
 }
 
@@ -869,6 +888,13 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         api_key: ctx.api_key.clone(),
         api_url: ctx.api_url.clone(),
         reliability: (*ctx.reliability).clone(),
+        auto_save_memory: ctx.auto_save_memory,
+        max_tool_iterations: ctx.max_tool_iterations,
+        min_relevance_score: ctx.min_relevance_score,
+        message_timeout_secs: ctx.message_timeout_secs,
+        multimodal: ctx.multimodal.clone(),
+        query_classification: ctx.query_classification.clone(),
+        model_routes: ctx.model_routes.as_ref().clone(),
     }
 }
 
@@ -2547,13 +2573,18 @@ async fn process_channel_message(
     let history_key = conversation_history_key(&msg);
     let mut route = get_route_selection(ctx.as_ref(), &history_key);
 
+    // Snapshot hot-reload config before per-message processing so all
+    // fields below use a consistent, potentially updated config version.
+    let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
+
     // ── Query classification: override route when a rule matches ──
-    if let Some(hint) =
-        zeroclaw_runtime::agent::classifier::classify(&ctx.query_classification, &msg.content)
-        && let Some(matched_route) = ctx
-            .model_routes
-            .iter()
-            .find(|r| r.hint.eq_ignore_ascii_case(&hint))
+    if let Some(hint) = zeroclaw_runtime::agent::classifier::classify(
+        &runtime_defaults.query_classification,
+        &msg.content,
+    ) && let Some(matched_route) = runtime_defaults
+        .model_routes
+        .iter()
+        .find(|r| r.hint.eq_ignore_ascii_case(&hint))
     {
         tracing::info!(
             target: "query_classification",
@@ -2569,8 +2600,6 @@ async fn process_channel_message(
             api_key: matched_route.api_key.clone(),
         };
     }
-
-    let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
     let mut active_provider = match get_or_create_provider(
         ctx.as_ref(),
         &route.provider,
@@ -2596,7 +2625,7 @@ async fn process_channel_message(
             return;
         }
     };
-    if ctx.auto_save_memory
+    if runtime_defaults.auto_save_memory
         && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
         && !zeroclaw_memory::should_skip_autosave_content(&msg.content)
     {
@@ -2713,7 +2742,7 @@ async fn process_channel_message(
     let sender_memory_fut = build_memory_context(
         ctx.memory.as_ref(),
         &msg.content,
-        ctx.min_relevance_score,
+        runtime_defaults.min_relevance_score,
         Some(&msg.sender),
     );
 
@@ -2721,7 +2750,7 @@ async fn process_channel_message(
         let group_memory_fut = build_memory_context(
             ctx.memory.as_ref(),
             &msg.content,
-            ctx.min_relevance_score,
+            runtime_defaults.min_relevance_score,
             Some(&history_key),
         );
         tokio::join!(sender_memory_fut, group_memory_fut)
@@ -2998,8 +3027,8 @@ async fn process_channel_message(
         .message_timeout_scale_max
         .unwrap_or(CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP);
     let timeout_budget_secs = channel_message_timeout_budget_secs_with_cap(
-        ctx.message_timeout_secs,
-        ctx.max_tool_iterations,
+        runtime_defaults.message_timeout_secs,
+        runtime_defaults.max_tool_iterations,
         scale_cap,
     );
     let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
@@ -3024,6 +3053,8 @@ async fn process_channel_message(
                             .or_else(|| Some(msg.id.clone())),
                         zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
+                        TOOL_LOOP_CANARY_TOKENS_ENABLED.scope(
+                            ctx.prompt_config.security.canary_tokens,
                         run_tool_call_loop(
                         active_provider.as_ref(),
                         &mut history,
@@ -3056,6 +3087,7 @@ async fn process_channel_message(
                         ctx.context_token_budget,
                         None, // shared_budget
                         target_channel.as_deref(),
+                    ),
                     ),
                     ),
                     ),

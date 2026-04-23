@@ -33,7 +33,7 @@ use crate::cost::types::BudgetCheck;
 use crate::i18n::ToolDescriptions;
 use crate::observability::{self, Observer, ObserverEvent, runtime_trace};
 use crate::platform;
-use crate::security::{AutonomyLevel, SecurityPolicy};
+use crate::security::{AutonomyLevel, CanaryGuard, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -278,6 +278,17 @@ pub fn scrub_credentials(input: &str) -> String {
             }
         })
         .to_string()
+}
+
+/// Returned when canary token exfiltration is detected in model output.
+const CANARY_EXFILTRATION_BLOCK_MESSAGE: &str =
+    "I blocked that response because it attempted to reveal protected internal context.";
+
+tokio::task_local! {
+    /// Controls whether per-turn canary tokens are injected. Set by callers that
+    /// have access to `config.security.canary_tokens`; defaults to `false` for
+    /// legacy call sites that haven't been updated.
+    pub static TOOL_LOOP_CANARY_TOKENS_ENABLED: bool;
 }
 
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
@@ -839,6 +850,25 @@ pub async fn run_tool_call_loop(
         },
     );
 
+    // ── Canary token guard ─────────────────────────────────────────────
+    let canary_guard = CanaryGuard::new(
+        TOOL_LOOP_CANARY_TOKENS_ENABLED
+            .try_with(|enabled| *enabled)
+            .unwrap_or(false),
+    );
+    let mut turn_canary_token: Option<String> = None;
+    if let Some(system_message) = history.first_mut() {
+        if system_message.role == "system" {
+            let (updated_prompt, token) = canary_guard.inject_turn_token(&system_message.content);
+            system_message.content = updated_prompt;
+            turn_canary_token = token;
+        }
+    }
+    let redact_trace_text = |text: &str| -> String {
+        let scrubbed = scrub_credentials(text);
+        canary_guard.redact_token_from_text(&scrubbed, turn_canary_token.as_deref())
+    };
+
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
 
@@ -1242,7 +1272,7 @@ pub async fn run_tool_call_loop(
                         serde_json::json!({
                             "iteration": iteration + 1,
                             "response_excerpt": truncate_with_ellipsis(
-                                &scrub_credentials(&response_text),
+                                &redact_trace_text(&response_text),
                                 600
                             ),
                         }),
@@ -1262,7 +1292,7 @@ pub async fn run_tool_call_loop(
                         "duration_ms": llm_started_at.elapsed().as_millis(),
                         "input_tokens": resp_input_tokens,
                         "output_tokens": resp_output_tokens,
-                        "raw_response": scrub_credentials(&response_text),
+                        "raw_response": redact_trace_text(&response_text),
                         "native_tool_calls": resp.tool_calls.len(),
                         "parsed_tool_calls": calls.len(),
                     }),
@@ -1363,6 +1393,34 @@ pub async fn run_tool_call_loop(
         } else {
             parsed_text
         };
+
+        // ── Canary exfiltration check ───────────────────────────────────
+        let canary_exfiltration_detected = canary_guard
+            .response_contains_canary(&response_text, turn_canary_token.as_deref())
+            || canary_guard.response_contains_canary(&display_text, turn_canary_token.as_deref());
+        if canary_exfiltration_detected {
+            runtime_trace::record_event(
+                "security_canary_exfiltration_blocked",
+                Some(channel_name),
+                Some(provider_name),
+                Some(model),
+                Some(&turn_id),
+                Some(false),
+                Some("llm output contained turn canary token"),
+                serde_json::json!({
+                    "iteration": iteration + 1,
+                    "response_excerpt": truncate_with_ellipsis(&redact_trace_text(&display_text), 600),
+                }),
+            );
+            if let Some(ref tx) = on_delta {
+                let _ = tx.send(StreamDelta::Text(CANARY_EXFILTRATION_BLOCK_MESSAGE.to_string())).await;
+            }
+            history.push(ChatMessage::assistant(
+                CANARY_EXFILTRATION_BLOCK_MESSAGE.to_string(),
+            ));
+            return Ok(CANARY_EXFILTRATION_BLOCK_MESSAGE.to_string());
+        }
+
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
             let llm_secs = llm_started_at.elapsed().as_secs();
@@ -1387,7 +1445,7 @@ pub async fn run_tool_call_loop(
                 None,
                 serde_json::json!({
                     "iteration": iteration + 1,
-                    "text": scrub_credentials(&display_text),
+                    "text": redact_trace_text(&display_text),
                 }),
             );
             // No tool calls — this is the final response.
@@ -2519,32 +2577,35 @@ pub async fn run(
             match TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(
                     cost_tracking_context.clone(),
-                    run_tool_call_loop(
-                        provider.as_ref(),
-                        &mut history,
-                        &tools_registry,
-                        observer.as_ref(),
-                        &provider_name,
-                        &model_name,
-                        effective_temperature,
-                        false,
-                        approval_manager.as_ref(),
-                        channel_name,
-                        None,
-                        &config.multimodal,
-                        config.agent.max_tool_iterations,
-                        None,
-                        None,
-                        None,
-                        &excluded_tools,
-                        &config.agent.tool_call_dedup_exempt,
-                        activated_handle.as_ref(),
-                        Some(model_switch_callback.clone()),
-                        &config.pacing,
-                        config.agent.max_tool_result_chars,
-                        config.agent.max_context_tokens,
-                        None, // shared_budget
-                        None, // channel: CLI mode — uses prompt_cli
+                    TOOL_LOOP_CANARY_TOKENS_ENABLED.scope(
+                        config.security.canary_tokens,
+                        run_tool_call_loop(
+                            provider.as_ref(),
+                            &mut history,
+                            &tools_registry,
+                            observer.as_ref(),
+                            &provider_name,
+                            &model_name,
+                            effective_temperature,
+                            false,
+                            approval_manager.as_ref(),
+                            channel_name,
+                            None,
+                            &config.multimodal,
+                            config.agent.max_tool_iterations,
+                            None,
+                            None,
+                            None,
+                            &excluded_tools,
+                            &config.agent.tool_call_dedup_exempt,
+                            activated_handle.as_ref(),
+                            Some(model_switch_callback.clone()),
+                            &config.pacing,
+                            config.agent.max_tool_result_chars,
+                            config.agent.max_context_tokens,
+                            None, // shared_budget
+                            None, // channel: CLI mode — uses prompt_cli
+                        ),
                     ),
                 )
                 .await
@@ -2880,32 +2941,35 @@ pub async fn run(
                 match TOOL_LOOP_COST_TRACKING_CONTEXT
                     .scope(
                         cost_tracking_context.clone(),
-                        run_tool_call_loop(
-                            provider.as_ref(),
-                            &mut history,
-                            &tools_registry,
-                            observer.as_ref(),
-                            &provider_name,
-                            &model_name,
-                            turn_temperature,
-                            true,
-                            approval_manager.as_ref(),
-                            channel_name,
-                            None,
-                            &config.multimodal,
-                            config.agent.max_tool_iterations,
-                            Some(cancel_token.clone()),
-                            Some(delta_tx.clone()),
-                            None,
-                            &excluded_tools,
-                            &config.agent.tool_call_dedup_exempt,
-                            activated_handle.as_ref(),
-                            Some(model_switch_callback.clone()),
-                            &config.pacing,
-                            config.agent.max_tool_result_chars,
-                            config.agent.max_context_tokens,
-                            None, // shared_budget
-                            None, // channel: interactive CLI — uses prompt_cli
+                        TOOL_LOOP_CANARY_TOKENS_ENABLED.scope(
+                            config.security.canary_tokens,
+                            run_tool_call_loop(
+                                provider.as_ref(),
+                                &mut history,
+                                &tools_registry,
+                                observer.as_ref(),
+                                &provider_name,
+                                &model_name,
+                                turn_temperature,
+                                true,
+                                approval_manager.as_ref(),
+                                channel_name,
+                                None,
+                                &config.multimodal,
+                                config.agent.max_tool_iterations,
+                                Some(cancel_token.clone()),
+                                Some(delta_tx.clone()),
+                                None,
+                                &excluded_tools,
+                                &config.agent.tool_call_dedup_exempt,
+                                activated_handle.as_ref(),
+                                Some(model_switch_callback.clone()),
+                                &config.pacing,
+                                config.agent.max_tool_result_chars,
+                                config.agent.max_context_tokens,
+                                None, // shared_budget
+                                None, // channel: interactive CLI — uses prompt_cli
+                            ),
                         ),
                     )
                     .await
