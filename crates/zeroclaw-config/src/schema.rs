@@ -5628,8 +5628,10 @@ pub struct AutonomyConfig {
     /// Tools to exclude from non-CLI channels (e.g. Telegram, Discord).
     ///
     /// When a tool is listed here, non-CLI channels will not expose it to the
-    /// model in tool specs.
-    #[serde(default)]
+    /// model in tool specs.  The built-in default includes `shell`, `process`,
+    /// `file_write`, `file_edit`, and other high-risk tools to protect against
+    /// prompt-injection on untrusted messaging channels.
+    #[serde(default = "default_non_cli_excluded_tools")]
     pub non_cli_excluded_tools: Vec<String>,
 
     /// Timeout in seconds for shell tool subprocesses. Default: 60.
@@ -5659,6 +5661,39 @@ fn default_auto_approve() -> Vec<String> {
 
 fn default_always_ask() -> Vec<String> {
     vec![]
+}
+
+fn default_non_cli_excluded_tools() -> Vec<String> {
+    [
+        "shell",
+        "process",
+        "file_write",
+        "file_edit",
+        "git_operations",
+        "browser",
+        "browser_open",
+        "http_request",
+        "schedule",
+        "cron_add",
+        "cron_remove",
+        "cron_update",
+        "cron_run",
+        "memory_store",
+        "memory_forget",
+        "proxy_config",
+        "web_search_config",
+        "web_access_config",
+        "model_routing_config",
+        "channel_ack_config",
+        "pushover",
+        "composio",
+        "delegate",
+        "screenshot",
+        "image_info",
+    ]
+    .into_iter()
+    .map(std::string::ToString::to_string)
+    .collect()
 }
 
 impl AutonomyConfig {
@@ -5735,7 +5770,7 @@ impl Default for AutonomyConfig {
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
-            non_cli_excluded_tools: Vec::new(),
+            non_cli_excluded_tools: default_non_cli_excluded_tools(),
             shell_timeout_secs: default_shell_timeout_secs(),
         }
     }
@@ -11462,6 +11497,23 @@ mod tests {
         assert!(a.require_approval_for_medium_risk);
         assert!(a.block_high_risk_commands);
         assert!(a.shell_env_passthrough.is_empty());
+    }
+
+    #[test]
+    async fn non_cli_excluded_tools_default_contains_process_and_shell() {
+        let a = AutonomyConfig::default();
+        assert!(
+            a.non_cli_excluded_tools.contains(&"process".to_string()),
+            "process tool should be excluded by default from non-CLI channels"
+        );
+        assert!(
+            a.non_cli_excluded_tools.contains(&"shell".to_string()),
+            "shell tool should be excluded by default from non-CLI channels"
+        );
+        assert!(
+            a.non_cli_excluded_tools.contains(&"delegate".to_string()),
+            "delegate tool should be excluded by default from non-CLI channels"
+        );
     }
 
     #[test]

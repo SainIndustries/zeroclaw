@@ -54,6 +54,9 @@ Notes:
 - `/new` clears the sender's conversation history without changing provider or model selection.
 - Model cache previews come from `zeroclaw models refresh --provider <ID>`.
 - These are runtime chat commands, not CLI subcommands.
+- `autonomy.non_cli_excluded_tools` is reloaded from `config.toml` at runtime; `/approvals` shows the currently effective list.
+- Default non-CLI exclusions include both `shell` and `process`; remove `process` from `[autonomy].non_cli_excluded_tools` only when you explicitly want background command execution in chat channels.
+- Each incoming message injects a runtime tool-availability snapshot into the system prompt, derived from the same exclusion policy used by execution.
 
 ## Inbound Image Marker Protocol
 

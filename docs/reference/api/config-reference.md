@@ -542,10 +542,12 @@ and must not end with `/`.
 | `block_high_risk_commands` | `true` | hard block for high-risk commands |
 | `auto_approve` | `[]` | tool operations always auto-approved |
 | `always_ask` | `[]` | tool operations that always require approval |
+| `non_cli_excluded_tools` | built-in denylist (includes `shell`, `process`, `file_write`, ...) | tools hidden from non-CLI channel tool specs |
 
 Notes:
 
 - `level = "full"` skips medium-risk approval gating for shell execution, while still enforcing configured guardrails.
+- By default, `process` is excluded on non-CLI channels alongside `shell`. To opt in intentionally, remove `"process"` from `[autonomy].non_cli_excluded_tools` in `config.toml`.
 - Access outside the workspace requires `allowed_roots`, even when `workspace_only = false`.
 - `allowed_roots` supports absolute paths, `~/...`, and workspace-relative paths.
 - `allowed_commands` entries can be command names (for example, `"git"`), explicit executable paths (for example, `"/usr/bin/antigravity"`), or `"*"` to allow any command name/path (risk gates still apply).
