@@ -1016,6 +1016,11 @@ pub async fn run_gateway(
         .route(
             "/api/canvas/{id}/history",
             get(canvas::handle_canvas_history),
+        )
+        // ── OpenAI-compatible chat completions (for Aura webapp + OpenAI SDK clients) ──
+        .route(
+            "/v1/chat/completions",
+            post(openai_compat::handle_chat_completions),
         );
 
     // ── WebAuthn hardware key authentication API (requires webauthn feature) ──
