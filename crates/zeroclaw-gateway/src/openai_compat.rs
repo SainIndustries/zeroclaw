@@ -55,10 +55,12 @@ impl SseFrame {
 /// Handler for POST /v1/chat/completions.
 ///
 /// Only streaming (SSE) is supported — non-streaming requests return 501.
-/// The full implementation is wired in a later task; this skeleton validates
-/// the request and returns an immediately-closed stream.
+/// Wires directly into `Agent::turn_streamed` following the same pattern as
+/// `ws::process_chat_message`: agent is constructed from config per-request,
+/// and the turn runs concurrently with a forwarding task that translates
+/// `TurnEvent`s into OpenAI SSE frames.
 pub async fn handle_chat_completions(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
     if !req.stream {
@@ -74,9 +76,7 @@ pub async fn handle_chat_completions(
         ));
     }
 
-    // Confirm there's at least one user message. We don't use it in the
-    // skeleton, but validating now produces the right error shape for clients.
-    let _user_message = req
+    let user_message = req
         .messages
         .iter()
         .rfind(|m| m.role == "user")
@@ -86,13 +86,120 @@ pub async fn handle_chat_completions(
             "no user message found in messages".to_string(),
         ))?;
 
-    // Skeleton: immediately-closed channel so the stream terminates cleanly.
-    // Task 12 replaces this with the real Agent::turn_streamed wiring.
-    let (tx_placeholder, rx) = mpsc::channel::<SseFrame>(64);
-    drop(tx_placeholder);
+    let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+    let model = req.model.clone();
 
-    let stream = ReceiverStream::new(rx).map(|frame: SseFrame| Ok(frame.to_event()));
+    // Outbound channel: SseFrame -> HTTP SSE stream
+    let (out_tx, out_rx) = mpsc::channel::<SseFrame>(64);
+    // Turn-event channel: Agent -> forwarder
+    let (evt_tx, mut evt_rx) =
+        mpsc::channel::<zeroclaw_runtime::agent::TurnEvent>(64);
 
+    // ── Forwarder task: TurnEvent -> SseFrame ────────────────────────────────
+    let completion_id_fwd = completion_id.clone();
+    let model_fwd = model.clone();
+    let out_tx_fwd = out_tx.clone();
+    tokio::spawn(async move {
+        // Emit role=assistant opener so clients know the stream has started.
+        let _ = out_tx_fwd
+            .send(SseFrame::Delta(build_chunk(
+                &completion_id_fwd,
+                &model_fwd,
+                serde_json::json!({ "role": "assistant" }),
+                None,
+            )))
+            .await;
+
+        let mut tool_call_index: u32 = 0;
+        while let Some(evt) = evt_rx.recv().await {
+            let frames = translate_turn_event(
+                evt,
+                &completion_id_fwd,
+                &model_fwd,
+                &mut tool_call_index,
+            );
+            for frame in frames {
+                if out_tx_fwd.send(SseFrame::Delta(frame)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    // ── Driver task: create agent, run turn, emit terminal frames ────────────
+    tokio::spawn(async move {
+        // Mirror ws::handle_socket: build an Agent from the current config.
+        // The config lock is released immediately after cloning.
+        let config = state.config.lock().clone();
+        let mut agent = match zeroclaw_runtime::agent::Agent::from_config(&config).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(error = %e, "Agent init failed for /v1/chat/completions");
+                let _ = out_tx
+                    .send(SseFrame::Delta(build_chunk(
+                        &completion_id,
+                        &model,
+                        serde_json::json!({}),
+                        Some("error"),
+                    )))
+                    .await;
+                let _ = out_tx.send(SseFrame::Done).await;
+                return;
+            }
+        };
+
+        // Run the agent turn, streaming events into evt_tx.
+        // We must not move agent into a separate spawn (it's &mut), so we
+        // drive both the turn and the event channel in a join — but the
+        // forwarder task above is already draining evt_rx concurrently, so
+        // we just await the turn here.  The channel backpressure ensures
+        // the forwarder keeps up.
+        let result = agent.turn_streamed(&user_message, evt_tx).await;
+
+        // Emit terminal finish_reason frame + [DONE] sentinel.
+        let finish = match &result {
+            Ok(_) => "stop",
+            Err(e) => {
+                tracing::warn!("/v1/chat/completions turn_streamed error: {e}");
+                "error"
+            }
+        };
+        let _ = out_tx
+            .send(SseFrame::Delta(build_chunk(
+                &completion_id,
+                &model,
+                serde_json::json!({}),
+                Some(finish),
+            )))
+            .await;
+        let _ = out_tx.send(SseFrame::Done).await;
+
+        // Fire-and-forget memory consolidation, mirroring ws::process_chat_message.
+        if let Ok(response) = result {
+            if state.auto_save {
+                let mem = state.mem.clone();
+                let provider = state.provider.clone();
+                let model_consolidate = model.clone();
+                let user_msg = user_message.clone();
+                let assistant_resp = response.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
+                        provider.as_ref(),
+                        &model_consolidate,
+                        mem.as_ref(),
+                        &user_msg,
+                        &assistant_resp,
+                    )
+                    .await
+                    {
+                        tracing::debug!("OpenAI-compat memory consolidation skipped: {e}");
+                    }
+                });
+            }
+        }
+    });
+
+    let stream = ReceiverStream::new(out_rx).map(|frame| Ok(frame.to_event()));
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
