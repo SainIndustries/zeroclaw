@@ -1642,11 +1642,8 @@ pub async fn run_gateway(
             "/api/canvas/{id}/history",
             get(canvas::handle_canvas_history),
         )
-        // ── OpenAI-compatible chat completions (for Aura webapp + OpenAI SDK clients) ──
-        .route(
-            "/v1/chat/completions",
-            post(openai_compat::handle_chat_completions),
-        );
+        // NOTE: /v1/chat/completions is in slow_routes below (no request timeout).
+        ;
 
     // ── WebAuthn hardware key authentication API (requires webauthn feature) ──
     #[cfg(feature = "webauthn")]
@@ -1683,10 +1680,13 @@ pub async fn run_gateway(
         get(api_plugins::plugin_routes::list_plugins),
     );
 
-    let inner = inner
-        // ── SSE event stream ──
-        .route("/api/events", get(sse::handle_sse_events))
-        .route("/api/events/history", get(sse::handle_events_history))
+    // ── Streaming routes — no request timeout (turns can run for minutes) ──
+    let slow_routes = Router::new()
+        // ── OpenAI-compatible chat completions (for Aura webapp + OpenAI SDK clients) ──
+        .route(
+            "/v1/chat/completions",
+            post(openai_compat::handle_chat_completions),
+        )
         // ── ACP client bridge ──
         .route("/acp", get(acp::handle_ws_acp))
         // ── WebSocket agent chat ──
@@ -1695,6 +1695,14 @@ pub async fn run_gateway(
         .route("/ws/canvas/{id}", get(canvas::handle_ws_canvas))
         // ── WebSocket node discovery ──
         .route("/ws/nodes", get(nodes::handle_ws_nodes))
+        .with_state(state.clone())
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE));
+
+    // ── Fast routes — request timeout applied ──
+    let fast_routes = inner
+        // ── SSE event stream ──
+        .route("/api/events", get(sse::handle_sse_events))
+        .route("/api/events/history", get(sse::handle_events_history))
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
         // ── SPA fallback: non-API GET requests serve index.html ──
@@ -1719,7 +1727,7 @@ pub async fn run_gateway(
             Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
         ));
 
-    let inner = inner.merge(cron_run_router);
+    let inner = fast_routes.merge(slow_routes).merge(cron_run_router);
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
