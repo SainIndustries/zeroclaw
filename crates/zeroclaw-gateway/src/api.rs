@@ -2061,6 +2061,7 @@ mod tests {
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             reload_tx: None,
+            aura_internal_secret: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }

@@ -483,6 +483,9 @@ pub struct AppState {
     /// TUI session registry from the daemon (for /api/tuis endpoint).
     /// `None` when the gateway runs standalone without a daemon.
     pub tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
+    /// Aura-webapp-specific shared bearer secret, accepted on /v1/chat/completions
+    /// in addition to paired tokens. None if AURA_INTERNAL_SECRET not set.
+    pub aura_internal_secret: Option<String>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -1415,6 +1418,7 @@ pub async fn run_gateway(
         cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tui_registry,
+        aura_internal_secret: std::env::var("AURA_INTERNAL_SECRET").ok(),
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -3775,6 +3779,7 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            aura_internal_secret: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3854,6 +3859,7 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            aura_internal_secret: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4416,6 +4422,7 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            aura_internal_secret: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4508,6 +4515,7 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            aura_internal_secret: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4612,6 +4620,7 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            aura_internal_secret: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4688,6 +4697,7 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            aura_internal_secret: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4769,6 +4779,7 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            aura_internal_secret: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4857,6 +4868,7 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            aura_internal_secret: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4942,6 +4954,7 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            aura_internal_secret: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };

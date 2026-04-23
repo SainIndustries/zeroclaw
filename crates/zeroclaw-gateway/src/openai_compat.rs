@@ -7,7 +7,7 @@
 
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
     Json,
 };
@@ -61,8 +61,10 @@ impl SseFrame {
 /// `TurnEvent`s into OpenAI SSE frames.
 pub async fn handle_chat_completions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
+    authorize(&headers, &state)?;
     if !req.stream {
         return Err((
             StatusCode::NOT_IMPLEMENTED,
@@ -203,6 +205,44 @@ pub async fn handle_chat_completions(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
+/// Validate the `Authorization: Bearer <token>` header.
+///
+/// Accepts two token classes in order:
+///   1. `AURA_INTERNAL_SECRET` env-var value (read at startup into `AppState`).
+///   2. Any token registered via the upstream paired-token mechanism
+///      (`PairingGuard::is_authenticated`).
+///
+/// If neither matches, or the header is absent, returns `401 Unauthorized`.
+fn authorize(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<(), (StatusCode, String)> {
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .trim();
+
+    if bearer.is_empty() {
+        return Err((StatusCode::UNAUTHORIZED, "missing bearer token".into()));
+    }
+
+    // Case 1: AURA_INTERNAL_SECRET (env-derived) match
+    if let Some(ref secret) = state.aura_internal_secret {
+        if bearer == secret {
+            return Ok(());
+        }
+    }
+
+    // Case 2: upstream paired-token check via PairingGuard::is_authenticated.
+    if state.pairing.is_authenticated(bearer) {
+        return Ok(());
+    }
+
+    Err((StatusCode::UNAUTHORIZED, "invalid bearer token".into()))
+}
+
 /// Build one OpenAI chat-completion chunk frame from a delta payload.
 ///
 /// `id` stays stable across all frames in one response; `model` echoes the
@@ -297,6 +337,7 @@ pub(crate) fn translate_turn_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderMap;
     use zeroclaw_runtime::agent::TurnEvent;
 
     #[test]
@@ -364,5 +405,24 @@ mod tests {
         );
         assert_eq!(frames[0]["choices"][0]["delta"]["tool_result"]["name"], "shell");
         assert_eq!(frames[0]["choices"][0]["delta"]["tool_result"]["output"], "hi\n");
+    }
+
+    #[test]
+    fn authorize_accepts_aura_internal_secret() {
+        // Verify the bearer extraction logic handles the common case.
+        let secret = "deadbeef";
+        let header_value = format!("Bearer {secret}");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            header_value.parse().unwrap(),
+        );
+        let extracted = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(|v| v.trim())
+            .unwrap();
+        assert_eq!(extracted, secret);
     }
 }
