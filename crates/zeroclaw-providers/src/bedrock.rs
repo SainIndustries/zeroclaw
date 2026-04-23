@@ -325,12 +325,68 @@ impl AwsCredentials {
         })
     }
 
-    /// Resolve credentials: env vars first, then credential_process, then EC2 IMDS.
+    /// Fetch credentials from the ECS container-credential endpoint.
+    /// Available when running on ECS/Fargate with a task IAM role.
+    async fn from_ecs() -> anyhow::Result<Self> {
+        let (url, auth_token) = resolve_ecs_endpoint().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Neither AWS_CONTAINER_CREDENTIALS_RELATIVE_URI nor \
+                 AWS_CONTAINER_CREDENTIALS_FULL_URI is set"
+            )
+        })?;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()?;
+
+        let mut req = client.get(&url);
+        if let Some(token) = auth_token {
+            req = req.header("Authorization", token);
+        }
+
+        let creds_json: serde_json::Value = req.send().await?.json().await?;
+
+        let access_key_id = creds_json["AccessKeyId"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing AccessKeyId in ECS credential response"))?
+            .to_string();
+        let secret_access_key = creds_json["SecretAccessKey"]
+            .as_str()
+            .ok_or_else(|| {
+                anyhow::anyhow!("Missing SecretAccessKey in ECS credential response")
+            })?
+            .to_string();
+        let session_token = creds_json["Token"].as_str().map(|s| s.to_string());
+
+        let region = env_optional("AWS_REGION")
+            .or_else(|| env_optional("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|| DEFAULT_REGION.to_string());
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "Loaded AWS credentials from ECS container credential endpoint"
+        );
+
+        Ok(Self {
+            access_key_id,
+            secret_access_key,
+            session_token,
+            region,
+            expires_at: None,
+        })
+    }
+
+    /// Resolve credentials: env vars first, then credential_process, then ECS
+    /// container endpoint, then EC2 IMDS.
     async fn resolve() -> anyhow::Result<Self> {
         if let Ok(creds) = Self::from_env() {
             return Ok(creds);
         }
         if let Ok(creds) = Self::from_credential_process() {
+            return Ok(creds);
+        }
+        if let Ok(creds) = Self::from_ecs().await {
             return Ok(creds);
         }
         Self::from_imds().await
@@ -374,6 +430,25 @@ fn env_optional(name: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// Resolve the ECS container-credential endpoint URL and optional auth token.
+///
+/// Returns `Some((url, auth_token))` if either `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`
+/// or `AWS_CONTAINER_CREDENTIALS_FULL_URI` is set, `None` otherwise.
+///
+/// Relative URIs are rooted at `http://169.254.170.2` (the well-known ECS
+/// container-credential endpoint). Full URIs (ECS Anywhere, custom setups) are
+/// used verbatim and may carry an auth token via `AWS_CONTAINER_AUTHORIZATION_TOKEN`.
+fn resolve_ecs_endpoint() -> Option<(String, Option<String>)> {
+    if let Some(rel) = env_optional("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") {
+        return Some((format!("http://169.254.170.2{rel}"), None));
+    }
+    if let Some(full) = env_optional("AWS_CONTAINER_CREDENTIALS_FULL_URI") {
+        let token = env_optional("AWS_CONTAINER_AUTHORIZATION_TOKEN");
+        return Some((full, token));
+    }
+    None
 }
 
 // ── AWS SigV4 Signing ───────────────────────────────────────────
@@ -2599,5 +2674,45 @@ region=ap-southeast-1
         assert!(model_provider.cached_credentials().is_none());
         model_provider.cache_credentials(&make_creds(Some(future)));
         assert!(model_provider.cached_credentials().is_some());
+    }
+
+    // ── resolve_ecs_endpoint tests ──────────────────────────────
+
+    #[test]
+    fn resolve_ecs_endpoint_uses_relative_uri() {
+        let _env_lock = env_lock();
+        let _rel_guard = EnvGuard::set("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", Some("/creds/abc"));
+        let _full_guard = EnvGuard::set("AWS_CONTAINER_CREDENTIALS_FULL_URI", None);
+        let _tok_guard = EnvGuard::set("AWS_CONTAINER_AUTHORIZATION_TOKEN", None);
+
+        let result = resolve_ecs_endpoint();
+        assert_eq!(
+            result,
+            Some(("http://169.254.170.2/creds/abc".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn resolve_ecs_endpoint_uses_full_uri_with_auth() {
+        let _env_lock = env_lock();
+        let _rel_guard = EnvGuard::set("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", None);
+        let _full_guard = EnvGuard::set("AWS_CONTAINER_CREDENTIALS_FULL_URI", Some("https://10.0.0.1/custom/creds"));
+        let _tok_guard = EnvGuard::set("AWS_CONTAINER_AUTHORIZATION_TOKEN", Some("mytoken"));
+
+        let result = resolve_ecs_endpoint();
+        assert_eq!(
+            result,
+            Some(("https://10.0.0.1/custom/creds".to_string(), Some("mytoken".to_string())))
+        );
+    }
+
+    #[test]
+    fn resolve_ecs_endpoint_returns_none_when_unset() {
+        let _env_lock = env_lock();
+        let _rel_guard = EnvGuard::set("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", None);
+        let _full_guard = EnvGuard::set("AWS_CONTAINER_CREDENTIALS_FULL_URI", None);
+
+        let result = resolve_ecs_endpoint();
+        assert_eq!(result, None);
     }
 }
