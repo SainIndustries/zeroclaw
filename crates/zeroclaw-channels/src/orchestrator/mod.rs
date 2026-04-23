@@ -856,11 +856,11 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         max_tool_iterations: config.agent.max_tool_iterations,
         min_relevance_score: config.memory.min_relevance_score,
         message_timeout_secs: effective_channel_message_timeout_secs(
-            config.channels.message_timeout_secs,
+            config.channels_config.message_timeout_secs,
         ),
         multimodal: config.multimodal.clone(),
         query_classification: config.query_classification.clone(),
-        model_routes: config.providers.model_routes.clone(),
+        model_routes: config.model_routes.clone(),
     }
 }
 
@@ -3067,8 +3067,8 @@ async fn process_channel_message(
                         Some(&*ctx.approval_manager),
                         msg.channel.as_str(),
                         Some(msg.reply_target.as_str()),
-                        &runtime_defaults.multimodal,
-                        runtime_defaults.max_tool_iterations,
+                        &ctx.multimodal,
+                        ctx.max_tool_iterations,
                         Some(cancellation_token.clone()),
                         delta_tx.clone(),
                         ctx.hooks.as_deref(),
@@ -3343,7 +3343,7 @@ async fn process_channel_message(
             }
 
             // Fire-and-forget LLM-driven memory consolidation.
-            if runtime_defaults.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+            if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
                 let provider = Arc::clone(&ctx.provider);
                 let model = ctx.model.to_string();
                 let memory = Arc::clone(&ctx.memory);
@@ -3527,9 +3527,7 @@ async fn process_channel_message(
         LlmExecutionResult::Completed(Err(_)) => {
             let timeout_msg = format!(
                 "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
-                timeout_budget_secs,
-                runtime_defaults.message_timeout_secs,
-                runtime_defaults.max_tool_iterations
+                timeout_budget_secs, ctx.message_timeout_secs, ctx.max_tool_iterations
             );
             runtime_trace::record_event(
                 "channel_message_timeout",
@@ -7695,14 +7693,6 @@ BTC is currently around $65,000 based on latest tool output."#
                         api_key: None,
                         api_url: None,
                         reliability: zeroclaw_config::schema::ReliabilityConfig::default(),
-                        auto_save_memory: false,
-                        max_tool_iterations: 5,
-                        min_relevance_score: 0.0,
-                        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-                        multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
-                        query_classification:
-                            zeroclaw_config::schema::QueryClassificationConfig::default(),
-                        model_routes: Vec::new(),
                     },
                     last_applied_stamp: None,
                 },
