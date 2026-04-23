@@ -385,6 +385,9 @@ pub struct AppState {
     /// WebAuthn state for hardware key authentication (optional, requires `webauthn` feature)
     #[cfg(feature = "webauthn")]
     pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
+    /// Aura-webapp-specific shared bearer secret, accepted on /v1/chat/completions
+    /// in addition to paired tokens. None if AURA_INTERNAL_SECRET not set.
+    pub aura_internal_secret: Option<String>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -906,6 +909,7 @@ pub async fn run_gateway(
         path_prefix: path_prefix.unwrap_or("").to_string(),
         web_dist_dir,
         canvas_store,
+        aura_internal_secret: std::env::var("AURA_INTERNAL_SECRET").ok(),
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -2411,6 +2415,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            aura_internal_secret: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2483,6 +2488,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            aura_internal_secret: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2881,6 +2887,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            aura_internal_secret: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2961,6 +2968,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            aura_internal_secret: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3053,6 +3061,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            aura_internal_secret: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3117,6 +3126,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            aura_internal_secret: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3186,6 +3196,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            aura_internal_secret: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3260,6 +3271,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            aura_internal_secret: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3331,6 +3343,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            aura_internal_secret: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
