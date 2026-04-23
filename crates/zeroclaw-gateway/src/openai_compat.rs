@@ -8,10 +8,12 @@
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::sse::{Event, KeepAlive, Sse},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     Json,
 };
-use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use tokio::sync::mpsc;
@@ -54,23 +56,17 @@ impl SseFrame {
 
 /// Handler for POST /v1/chat/completions.
 ///
-/// Only streaming (SSE) is supported — non-streaming requests return 501.
-/// Wires directly into `Agent::turn_streamed` following the same pattern as
-/// `ws::process_chat_message`: agent is constructed from config per-request,
-/// and the turn runs concurrently with a forwarding task that translates
-/// `TurnEvent`s into OpenAI SSE frames.
+/// Supports both streaming (`stream: true`, SSE) and non-streaming
+/// (`stream: false`, single JSON body). The streaming path wires into
+/// `Agent::turn_streamed` following the same pattern as
+/// `ws::process_chat_message`; the non-streaming path uses `Agent::turn`
+/// and returns a full `chat.completion` JSON response.
 pub async fn handle_chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
+) -> Result<Response, (StatusCode, String)> {
     authorize(&headers, &state)?;
-    if !req.stream {
-        return Err((
-            StatusCode::NOT_IMPLEMENTED,
-            "non-streaming /v1/chat/completions is not supported".to_string(),
-        ));
-    }
     if req.messages.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -87,6 +83,10 @@ pub async fn handle_chat_completions(
             StatusCode::BAD_REQUEST,
             "no user message found in messages".to_string(),
         ))?;
+
+    if !req.stream {
+        return handle_non_streaming(state, req.model, user_message).await;
+    }
 
     let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     let model = req.model.clone();
@@ -206,8 +206,81 @@ pub async fn handle_chat_completions(
         }
     });
 
-    let stream = ReceiverStream::new(out_rx).map(|frame| Ok(frame.to_event()));
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    let stream = ReceiverStream::new(out_rx)
+        .map(|frame| Ok::<Event, Infallible>(frame.to_event()));
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
+}
+
+/// Non-streaming path: run `Agent::turn` synchronously and return a single
+/// `chat.completion` JSON response. Used by callers that can't consume SSE
+/// (Blooio iMessage webhook, voice LLM proxy). Tool calls execute
+/// internally; the response contains only the final assistant message.
+async fn handle_non_streaming(
+    state: AppState,
+    model: String,
+    user_message: String,
+) -> Result<Response, (StatusCode, String)> {
+    let config = state.config.lock().clone();
+    let mut agent = zeroclaw_runtime::agent::Agent::from_config(&config)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Agent init failed for non-streaming /v1/chat/completions");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("agent init failed: {e}"),
+            )
+        })?;
+
+    let response_text = agent.turn(&user_message).await.map_err(|e| {
+        tracing::warn!(error = %e, "non-streaming /v1/chat/completions turn error");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("turn failed: {e}"),
+        )
+    })?;
+
+    // Fire-and-forget memory consolidation, mirroring the streaming path.
+    if state.auto_save {
+        let mem = state.mem.clone();
+        let provider = state.provider.clone();
+        let model_consolidate = model.clone();
+        let user_msg = user_message.clone();
+        let assistant_resp = response_text.clone();
+        tokio::spawn(async move {
+            if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
+                provider.as_ref(),
+                &model_consolidate,
+                mem.as_ref(),
+                &user_msg,
+                &assistant_resp,
+            )
+            .await
+            {
+                tracing::debug!(
+                    "non-streaming /v1/chat/completions memory consolidation skipped: {e}"
+                );
+            }
+        });
+    }
+
+    let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+    let created = chrono::Utc::now().timestamp();
+    let body = serde_json::json!({
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": response_text,
+            },
+            "finish_reason": "stop",
+        }],
+    });
+
+    Ok(Json(body).into_response())
 }
 
 /// Validate the `Authorization: Bearer <token>` header.
