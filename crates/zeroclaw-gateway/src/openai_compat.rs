@@ -95,3 +95,167 @@ pub async fn handle_chat_completions(
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
+
+/// Build one OpenAI chat-completion chunk frame from a delta payload.
+///
+/// `id` stays stable across all frames in one response; `model` echoes the
+/// request's `model` field; `delta` is the per-frame JSON object (role/content
+/// /tool_calls/etc.); `finish_reason` is `None` for intermediate frames and
+/// `Some("stop")` / `Some("tool_calls")` / `Some("error")` for terminators.
+fn build_chunk(
+    id: &str,
+    model: &str,
+    delta: serde_json::Value,
+    finish_reason: Option<&str>,
+) -> serde_json::Value {
+    let created = chrono::Utc::now().timestamp();
+    serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish_reason,
+        }]
+    })
+}
+
+/// Translate one `TurnEvent` into zero or more OpenAI chunk frames.
+///
+/// `tool_call_index` is a running counter for the `tool_calls[].index`
+/// field; each distinct ToolCall event increments it.
+pub(crate) fn translate_turn_event(
+    event: zeroclaw_runtime::agent::TurnEvent,
+    id: &str,
+    model: &str,
+    tool_call_index: &mut u32,
+) -> Vec<serde_json::Value> {
+    use zeroclaw_runtime::agent::TurnEvent;
+    match event {
+        TurnEvent::Chunk { delta } => vec![build_chunk(
+            id,
+            model,
+            serde_json::json!({ "content": delta }),
+            None,
+        )],
+        TurnEvent::Thinking { delta } => {
+            // OpenAI has no standard "thinking" delta field. We emit it as a
+            // non-standard field that strict OpenAI clients ignore and
+            // Aura-aware clients can surface.
+            vec![build_chunk(
+                id,
+                model,
+                serde_json::json!({ "reasoning": delta }),
+                None,
+            )]
+        }
+        TurnEvent::ToolCall { name, args } => {
+            let idx = *tool_call_index;
+            *tool_call_index += 1;
+            let call_id = format!("call_{}", uuid::Uuid::new_v4().simple());
+            vec![build_chunk(
+                id,
+                model,
+                serde_json::json!({
+                    "tool_calls": [{
+                        "index": idx,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": args.to_string(),
+                        }
+                    }]
+                }),
+                None,
+            )]
+        }
+        TurnEvent::ToolResult { name, output } => {
+            // OpenAI SSE has no native "tool result in stream". We emit a
+            // non-standard `tool_result` field; strict clients ignore it.
+            vec![build_chunk(
+                id,
+                model,
+                serde_json::json!({
+                    "tool_result": { "name": name, "output": output }
+                }),
+                None,
+            )]
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroclaw_runtime::agent::TurnEvent;
+
+    #[test]
+    fn chunk_event_emits_content_delta() {
+        let mut idx = 0;
+        let frames = translate_turn_event(
+            TurnEvent::Chunk { delta: "hi".to_string() },
+            "chatcmpl-test",
+            "m",
+            &mut idx,
+        );
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["choices"][0]["delta"]["content"], "hi");
+        assert_eq!(idx, 0, "content chunk should not advance tool index");
+    }
+
+    #[test]
+    fn thinking_event_emits_reasoning_field() {
+        let mut idx = 0;
+        let frames = translate_turn_event(
+            TurnEvent::Thinking { delta: "pondering".to_string() },
+            "chatcmpl-test",
+            "m",
+            &mut idx,
+        );
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["choices"][0]["delta"]["reasoning"], "pondering");
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn tool_call_event_emits_tool_calls_with_index() {
+        let mut idx = 5;
+        let frames = translate_turn_event(
+            TurnEvent::ToolCall {
+                name: "shell".to_string(),
+                args: serde_json::json!({ "cmd": "echo hi" }),
+            },
+            "chatcmpl-test",
+            "m",
+            &mut idx,
+        );
+        let call = &frames[0]["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(call["index"], 5);
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "shell");
+        assert!(call["function"]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("echo hi"));
+        assert_eq!(idx, 6, "tool call should advance index by 1");
+    }
+
+    #[test]
+    fn tool_result_event_emits_nonstandard_tool_result_field() {
+        let mut idx = 0;
+        let frames = translate_turn_event(
+            TurnEvent::ToolResult {
+                name: "shell".to_string(),
+                output: "hi\n".to_string(),
+            },
+            "chatcmpl-test",
+            "m",
+            &mut idx,
+        );
+        assert_eq!(frames[0]["choices"][0]["delta"]["tool_result"]["name"], "shell");
+        assert_eq!(frames[0]["choices"][0]["delta"]["tool_result"]["output"], "hi\n");
+    }
+}
