@@ -587,7 +587,11 @@ struct ResponseToolUseWrapper {
 // ── BedrockProvider ─────────────────────────────────────────────
 
 pub struct BedrockProvider {
+    /// Current auth mode. For SigV4, this holds the most recently resolved
+    /// creds; `resolve_auth` may refresh them via `cached_sigv4` below.
     auth: Option<BedrockAuth>,
+    /// TTL-aware cache for SigV4 credentials. `None` when using a BearerToken.
+    cached_sigv4: Option<CachedCredentials>,
     max_tokens: u32,
 }
 
@@ -599,30 +603,34 @@ impl Default for BedrockProvider {
 
 impl BedrockProvider {
     pub fn new() -> Self {
-        // Bearer token takes precedence over SigV4 credentials.
+        // Bearer token takes precedence over SigV4.
         if let Some(token) = env_optional("BEDROCK_API_KEY") {
             return Self {
                 auth: Some(BedrockAuth::BearerToken(token)),
+                cached_sigv4: None,
                 max_tokens: DEFAULT_MAX_TOKENS,
             };
         }
+        let initial = AwsCredentials::from_env().ok();
         Self {
-            auth: AwsCredentials::from_env().ok().map(BedrockAuth::SigV4),
+            auth: initial.clone().map(BedrockAuth::SigV4),
+            cached_sigv4: Some(CachedCredentials::new(initial)),
             max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
 
     pub async fn new_async() -> Self {
-        // Bearer token takes precedence over SigV4 credentials.
         if let Some(token) = env_optional("BEDROCK_API_KEY") {
             return Self {
                 auth: Some(BedrockAuth::BearerToken(token)),
+                cached_sigv4: None,
                 max_tokens: DEFAULT_MAX_TOKENS,
             };
         }
-        let auth = AwsCredentials::resolve().await.ok().map(BedrockAuth::SigV4);
+        let initial = AwsCredentials::resolve().await.ok();
         Self {
-            auth,
+            auth: initial.clone().map(BedrockAuth::SigV4),
+            cached_sigv4: Some(CachedCredentials::new(initial)),
             max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
@@ -631,6 +639,7 @@ impl BedrockProvider {
     pub fn with_bearer_token(token: &str) -> Self {
         Self {
             auth: Some(BedrockAuth::BearerToken(token.to_string())),
+            cached_sigv4: None,
             max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
@@ -676,28 +685,28 @@ impl BedrockProvider {
         format!("/model/{encoded}/converse")
     }
 
-    /// Resolve auth: use cached if available, otherwise try env vars then IMDS.
+    /// Resolve auth: prefer bearer token, otherwise refresh SigV4 credentials
+    /// through the TTL cache so long sessions never sign with expired creds.
     async fn resolve_auth(&self) -> anyhow::Result<BedrockAuth> {
-        // If we already have auth cached, re-resolve from the same source.
-        if let Some(ref auth) = self.auth {
-            match auth {
-                BedrockAuth::BearerToken(token) => {
-                    return Ok(BedrockAuth::BearerToken(token.clone()));
-                }
-                BedrockAuth::SigV4(_) => {
-                    // Re-resolve SigV4 credentials (they may have rotated).
-                }
-            }
+        // If configured with a bearer token, reuse it unchanged.
+        if let Some(BedrockAuth::BearerToken(ref token)) = self.auth {
+            return Ok(BedrockAuth::BearerToken(token.clone()));
         }
-        // Check Bearer token first.
+
+        // Otherwise, either we are using SigV4 (cached) or auth was never set.
+        // Check cached_sigv4 first; if present, it drives refresh.
+        if let Some(ref cache) = self.cached_sigv4 {
+            return Ok(BedrockAuth::SigV4(cache.get().await?));
+        }
+
+        // No cache and no bearer token: check env var precedence once more.
         if let Some(token) = env_optional("BEDROCK_API_KEY") {
             return Ok(BedrockAuth::BearerToken(token));
         }
-        // Fall back to SigV4.
         if let Ok(creds) = AwsCredentials::from_env() {
             return Ok(BedrockAuth::SigV4(creds));
         }
-        Ok(BedrockAuth::SigV4(AwsCredentials::from_imds().await?))
+        Ok(BedrockAuth::SigV4(AwsCredentials::resolve().await?))
     }
 
     // ── Cache heuristics (same thresholds as AnthropicProvider) ──
@@ -1501,6 +1510,7 @@ mod tests {
             let _env_lock = env_lock();
             BedrockProvider {
                 auth: None,
+                cached_sigv4: None,
                 max_tokens: DEFAULT_MAX_TOKENS,
             }
         };
@@ -1841,6 +1851,7 @@ mod tests {
     async fn warmup_without_credentials_is_noop() {
         let provider = BedrockProvider {
             auth: None,
+            cached_sigv4: None,
             max_tokens: DEFAULT_MAX_TOKENS,
         };
         let result = provider.warmup().await;
@@ -1851,6 +1862,7 @@ mod tests {
     fn capabilities_reports_native_tool_calling() {
         let provider = BedrockProvider {
             auth: None,
+            cached_sigv4: None,
             max_tokens: DEFAULT_MAX_TOKENS,
         };
         let caps = provider.capabilities();
