@@ -30,7 +30,7 @@ curl -sS -N \
   --data @- \
   "http://127.0.0.1:${PORT}/v1/chat/completions" <<JSON > "$RAW"
 {
-  "model": "bedrock/anthropic.claude-sonnet-4-20250514-v1:0",
+  "model": "bedrock/us.anthropic.claude-sonnet-4-6",
   "stream": true,
   "messages": [
     {"role": "user", "content": "${PROMPT}"}
