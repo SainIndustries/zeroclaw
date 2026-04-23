@@ -14,7 +14,6 @@ use axum::{
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
@@ -59,7 +58,7 @@ impl SseFrame {
 /// The full implementation is wired in a later task; this skeleton validates
 /// the request and returns an immediately-closed stream.
 pub async fn handle_chat_completions(
-    State(_state): State<Arc<AppState>>,
+    State(_state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
     if !req.stream {
