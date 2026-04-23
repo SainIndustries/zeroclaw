@@ -2,6 +2,7 @@ use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
 use crate::agent::eval::AutoClassifyExt;
+use crate::agent::history::{extract_facts_from_turns, TurnBuffer};
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::i18n::ToolDescriptions;
@@ -40,6 +41,7 @@ pub struct Agent {
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     auto_save: bool,
     memory_session_id: Option<String>,
+    turn_buffer: TurnBuffer,
     history: Vec<ConversationMessage>,
     classification_config: zeroclaw_config::schema::QueryClassificationConfig,
     available_hints: Vec<String>,
@@ -318,6 +320,7 @@ impl AgentBuilder {
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
             auto_save: self.auto_save.unwrap_or(false),
             memory_session_id: self.memory_session_id,
+            turn_buffer: TurnBuffer::new(),
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
@@ -952,6 +955,25 @@ impl Agent {
                     )));
                 self.trim_history();
 
+                // ── Post-turn fact extraction ──────────────────────
+                if self.auto_save {
+                    self.turn_buffer.push(user_message, &final_text);
+                    if self.turn_buffer.should_extract() {
+                        let turns = self.turn_buffer.drain_for_extraction();
+                        let result = extract_facts_from_turns(
+                            self.provider.as_ref(),
+                            &self.model_name,
+                            &turns,
+                            self.memory.as_ref(),
+                            self.memory_session_id.as_deref(),
+                        )
+                        .await;
+                        if result.stored > 0 || result.no_facts {
+                            self.turn_buffer.mark_extract_success();
+                        }
+                    }
+                }
+
                 return Ok(final_text);
             }
 
@@ -1223,6 +1245,25 @@ impl Agent {
                     )));
                 self.trim_history();
 
+                // ── Post-turn fact extraction ──────────────────────
+                if self.auto_save {
+                    self.turn_buffer.push(user_message, &final_text);
+                    if self.turn_buffer.should_extract() {
+                        let turns = self.turn_buffer.drain_for_extraction();
+                        let result = extract_facts_from_turns(
+                            self.provider.as_ref(),
+                            &self.model_name,
+                            &turns,
+                            self.memory.as_ref(),
+                            self.memory_session_id.as_deref(),
+                        )
+                        .await;
+                        if result.stored > 0 || result.no_facts {
+                            self.turn_buffer.mark_extract_success();
+                        }
+                    }
+                }
+
                 return Ok(final_text);
             }
 
@@ -1273,8 +1314,44 @@ impl Agent {
         )
     }
 
+    /// Flush any remaining buffered turns for fact extraction.
+    /// Call this when the session/conversation ends to avoid losing
+    /// facts from short (< 5 turn) sessions.
+    ///
+    /// On failure the turns are restored so callers that keep the agent
+    /// alive can still fall back to compaction-based extraction.
+    pub async fn flush_turn_buffer(&mut self) {
+        if !self.auto_save || self.turn_buffer.is_empty() {
+            return;
+        }
+        let turns = self.turn_buffer.drain_for_extraction();
+        let result = extract_facts_from_turns(
+            self.provider.as_ref(),
+            &self.model_name,
+            &turns,
+            self.memory.as_ref(),
+            self.memory_session_id.as_deref(),
+        )
+        .await;
+        if result.stored > 0 || result.no_facts {
+            self.turn_buffer.mark_extract_success();
+        } else {
+            // Restore turns so compaction fallback can still pick them up
+            // if the agent isn't dropped immediately.
+            tracing::warn!(
+                "Exit flush failed; restoring {} turn(s) to buffer",
+                turns.len()
+            );
+            for (u, a) in turns {
+                self.turn_buffer.push(&u, &a);
+            }
+        }
+    }
+
     pub async fn run_single(&mut self, message: &str) -> Result<String> {
-        self.turn(message).await
+        let result = self.turn(message).await?;
+        self.flush_turn_buffer().await;
+        Ok(result)
     }
 
     pub async fn run_interactive(&mut self) -> Result<()> {
@@ -1303,6 +1380,7 @@ impl Agent {
         }
 
         listen_handle.abort();
+        self.flush_turn_buffer().await;
         Ok(())
     }
 }
