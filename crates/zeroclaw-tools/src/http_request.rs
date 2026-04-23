@@ -1,9 +1,11 @@
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
+use zeroclaw_config::schema::HttpRequestCredentialProfile;
 
 /// HTTP request tool for API interactions.
 /// Supports GET, POST, PUT, DELETE methods with configurable security.
@@ -13,6 +15,8 @@ pub struct HttpRequestTool {
     max_response_size: usize,
     timeout_secs: u64,
     allow_private_hosts: bool,
+    credential_profiles: HashMap<String, HttpRequestCredentialProfile>,
+    credential_cache: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl HttpRequestTool {
@@ -22,14 +26,137 @@ impl HttpRequestTool {
         max_response_size: usize,
         timeout_secs: u64,
         allow_private_hosts: bool,
+        credential_profiles: HashMap<String, HttpRequestCredentialProfile>,
     ) -> Self {
+        // Normalize profile keys to lowercase for case-insensitive lookup.
+        let credential_profiles: HashMap<String, HttpRequestCredentialProfile> =
+            credential_profiles
+                .into_iter()
+                .map(|(name, profile)| (name.trim().to_ascii_lowercase(), profile))
+                .collect();
+
+        // Eagerly cache any non-empty env vars that are already set so that a
+        // subsequent credential rotation + transient removal still resolves.
+        let mut credential_cache = HashMap::new();
+        for profile in credential_profiles.values() {
+            let env_var = profile.env_var.trim();
+            if env_var.is_empty() {
+                continue;
+            }
+            if let Some(secret) = Self::read_non_empty_env_var(env_var) {
+                credential_cache.insert(env_var.to_string(), secret);
+            }
+        }
+
         Self {
             security,
             allowed_domains: normalize_allowed_domains(allowed_domains),
             max_response_size,
             timeout_secs,
             allow_private_hosts,
+            credential_profiles,
+            credential_cache: std::sync::Mutex::new(credential_cache),
         }
+    }
+
+    // ── Credential resolution helpers ────────────────────────────────
+
+    fn read_non_empty_env_var(name: &str) -> Option<String> {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn cache_secret(&self, env_var: &str, secret: &str) {
+        let mut guard = self
+            .credential_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.insert(env_var.to_string(), secret.to_string());
+    }
+
+    fn cached_secret(&self, env_var: &str) -> Option<String> {
+        let guard = self
+            .credential_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.get(env_var).cloned()
+    }
+
+    /// Resolve the secret for a credential profile's env var.
+    ///
+    /// Resolution order:
+    /// 1. If the env var is set and non-empty: use it (and refresh cache).
+    /// 2. If the env var is set but **empty**: hard-fail — this is explicit
+    ///    misconfiguration and must not silently fall back to a stale value.
+    /// 3. If the env var is absent: fall back to cache (tolerates transient
+    ///    removal after initial successful resolution).
+    /// 4. If absent and no cache: hard-fail.
+    fn resolve_secret_for_profile(
+        &self,
+        requested_name: &str,
+        env_var: &str,
+    ) -> anyhow::Result<String> {
+        match std::env::var(env_var) {
+            Ok(secret_raw) => {
+                let secret = secret_raw.trim();
+                if secret.is_empty() {
+                    // Hard-fail: set-but-empty is explicit misconfiguration.
+                    anyhow::bail!(
+                        "credential_profile '{requested_name}' uses environment variable {env_var}, but it is empty"
+                    );
+                }
+                self.cache_secret(env_var, secret);
+                Ok(secret.to_string())
+            }
+            Err(_) => {
+                // Env var absent — fall back to cached value if we have one.
+                if let Some(cached) = self.cached_secret(env_var) {
+                    tracing::warn!(
+                        profile = requested_name,
+                        env_var,
+                        "http_request credential env var unavailable; using cached secret"
+                    );
+                    return Ok(cached);
+                }
+                anyhow::bail!(
+                    "credential_profile '{requested_name}' requires environment variable {env_var}"
+                );
+            }
+        }
+    }
+
+    /// Resolve a named credential profile into headers to inject and a list of
+    /// sensitive values to redact from logs.
+    ///
+    /// Returns `(headers, sensitive_values)`.
+    fn resolve_credential_profile(
+        &self,
+        requested_name: &str,
+    ) -> anyhow::Result<(Vec<(String, String)>, Vec<String>)> {
+        let lookup_name = requested_name.trim().to_ascii_lowercase();
+        let profile = self
+            .credential_profiles
+            .get(&lookup_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "credential_profile '{requested_name}' is not defined in config"
+                )
+            })?;
+
+        let env_var = profile.env_var.trim();
+        if env_var.is_empty() {
+            anyhow::bail!("credential_profile '{requested_name}' has an empty env_var in config");
+        }
+
+        let secret = self.resolve_secret_for_profile(requested_name, env_var)?;
+
+        let header_value = format!("{}{}", profile.value_prefix, secret);
+        let sensitive_values = vec![secret.clone(), header_value.clone()];
+
+        let headers = vec![(profile.header_name.clone(), header_value)];
+        Ok((headers, sensitive_values))
     }
 
     fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
@@ -177,7 +304,7 @@ impl Tool for HttpRequestTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
+        let mut schema = json!({
             "type": "object",
             "properties": {
                 "url": {
@@ -200,7 +327,22 @@ impl Tool for HttpRequestTool {
                 }
             },
             "required": ["url"]
-        })
+        });
+
+        // Only advertise credential_profile if profiles are configured so the
+        // agent isn't confused by a parameter that has no valid values.
+        if !self.credential_profiles.is_empty() {
+            let profile_names: Vec<&str> = self.credential_profiles.keys().map(String::as_str).collect();
+            schema["properties"]["credential_profile"] = json!({
+                "type": "string",
+                "description": "Optional named credential profile to use for authentication. \
+                    The profile resolves an env-backed secret and injects it as a request header \
+                    (e.g. Authorization: Bearer <token>). Available profiles are defined in config.",
+                "enum": profile_names
+            });
+        }
+
+        schema
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -251,7 +393,32 @@ impl Tool for HttpRequestTool {
             }
         };
 
-        let request_headers = self.parse_headers(&headers_val);
+        let mut request_headers = self.parse_headers(&headers_val);
+
+        // Resolve credential profile if requested.
+        let credential_profile_name = args.get("credential_profile").and_then(|v| v.as_str());
+        if let Some(profile_name) = credential_profile_name {
+            match self.resolve_credential_profile(profile_name) {
+                Ok((profile_headers, _sensitive)) => {
+                    // Inject profile headers; caller-supplied headers take priority.
+                    for (k, v) in profile_headers {
+                        let already_set = request_headers
+                            .iter()
+                            .any(|(ek, _)| ek.to_lowercase() == k.to_lowercase());
+                        if !already_set {
+                            request_headers.push((k, v));
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        }
 
         match self
             .execute_request(&url, method, request_headers, body)
@@ -479,6 +646,7 @@ mod tests {
             1_000_000,
             30,
             allow_private_hosts,
+            HashMap::new(),
         )
     }
 
@@ -586,7 +754,7 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30, false);
+        let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30, false, HashMap::new());
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -702,7 +870,7 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30, false);
+        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30, false, HashMap::new());
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -717,7 +885,7 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30, false);
+        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30, false, HashMap::new());
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -741,6 +909,7 @@ mod tests {
             10,
             30,
             false,
+            HashMap::new(),
         );
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);
@@ -756,6 +925,7 @@ mod tests {
             0, // max_response_size = 0 means no limit
             30,
             false,
+            HashMap::new(),
         );
         let text = "a".repeat(10_000_000);
         assert_eq!(tool.truncate_response(&text), text);
@@ -769,6 +939,7 @@ mod tests {
             5,
             30,
             false,
+            HashMap::new(),
         );
         let text = "hello world";
         let truncated = tool.truncate_response(text);
@@ -1037,5 +1208,137 @@ mod tests {
                 .to_string()
                 .contains("local/private")
         );
+    }
+
+    // ── credential_profile tests (ported from fork 37d22440 + 4df1487e) ──
+
+    fn make_tool_with_profile(
+        env_var: &str,
+        header_name: &str,
+        value_prefix: &str,
+        profile_name: &str,
+    ) -> HttpRequestTool {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            profile_name.to_string(),
+            HttpRequestCredentialProfile {
+                header_name: header_name.to_string(),
+                env_var: env_var.to_string(),
+                value_prefix: value_prefix.to_string(),
+            },
+        );
+        HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            1_000_000,
+            30,
+            false,
+            profiles,
+        )
+    }
+
+    /// A profile that is set at construction time should resolve its bearer
+    /// token and inject it as the correct header.
+    #[test]
+    fn credential_profile_resolves_and_injects_bearer() {
+        let env_var = format!(
+            "ZEROCLAW_TEST_CRED_BEARER_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        );
+        let secret = "test-bearer-secret-abc";
+        unsafe { std::env::set_var(&env_var, secret) };
+
+        let tool = make_tool_with_profile(&env_var, "Authorization", "Bearer ", "myapi");
+
+        let (headers, sensitive_values) = tool
+            .resolve_credential_profile("myapi")
+            .expect("profile should resolve");
+
+        // Clean up before any asserts that might panic.
+        unsafe { std::env::remove_var(&env_var) };
+
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, "Authorization");
+        assert_eq!(headers[0].1, format!("Bearer {secret}"));
+        assert!(sensitive_values.contains(&secret.to_string()));
+        assert!(sensitive_values.contains(&format!("Bearer {secret}")));
+    }
+
+    /// When the env var is set-but-empty the tool must hard-fail rather than
+    /// silently fall back to a cached value (4df1487e semantic).
+    #[test]
+    fn credential_profile_hard_fails_on_empty_env() {
+        let env_var = format!(
+            "ZEROCLAW_TEST_CRED_EMPTY_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        );
+        // Prime the cache by setting a non-empty value at construction time.
+        unsafe { std::env::set_var(&env_var, "initial-secret") };
+
+        let tool = make_tool_with_profile(&env_var, "Authorization", "Bearer ", "empty-test");
+
+        // Overwrite to empty — this must be treated as explicit misconfiguration.
+        unsafe { std::env::set_var(&env_var, "") };
+        let err = tool
+            .resolve_credential_profile("empty-test")
+            .expect_err("empty env var must hard-fail")
+            .to_string();
+
+        unsafe { std::env::remove_var(&env_var) };
+
+        assert!(
+            err.contains("but it is empty"),
+            "Expected 'but it is empty' in error, got: {err}"
+        );
+    }
+
+    /// After a non-empty value is resolved it is cached; if the env var is
+    /// subsequently *removed* (not set-to-empty) the cached value is used.
+    #[test]
+    fn credential_profile_uses_cached_secret_when_env_removed() {
+        let env_var = format!(
+            "ZEROCLAW_TEST_CRED_CACHE_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        );
+        let secret = "cached-secret-xyz";
+        unsafe { std::env::set_var(&env_var, secret) };
+
+        let tool = make_tool_with_profile(&env_var, "Authorization", "Bearer ", "cache-test");
+
+        // Remove entirely (not set to empty) — cache fallback should kick in.
+        unsafe { std::env::remove_var(&env_var) };
+
+        let (headers, _) = tool
+            .resolve_credential_profile("cache-test")
+            .expect("cached credential should resolve after env removal");
+
+        assert_eq!(headers[0].1, format!("Bearer {secret}"));
+    }
+
+    /// An unknown profile name must return a clear error.
+    #[test]
+    fn credential_profile_unknown_name_errors() {
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            1_000_000,
+            30,
+            false,
+            HashMap::new(),
+        );
+        let err = tool
+            .resolve_credential_profile("nonexistent")
+            .expect_err("unknown profile should error")
+            .to_string();
+        assert!(err.contains("not defined in config"), "got: {err}");
     }
 }

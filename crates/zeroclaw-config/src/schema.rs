@@ -2690,6 +2690,50 @@ impl Default for BrowserConfig {
 
 // ── HTTP request tool ───────────────────────────────────────────
 
+/// Named credential profile for the `http_request` tool.
+///
+/// Each profile describes how to resolve a secret from an environment variable
+/// and how to inject it into an outbound request header.
+///
+/// Example TOML:
+/// ```toml
+/// [http_request.credential_profiles.github]
+/// env_var = "GITHUB_TOKEN"
+/// header_name = "Authorization"
+/// value_prefix = "Bearer "
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct HttpRequestCredentialProfile {
+    /// Header name to inject (for example `Authorization` or `X-API-Key`)
+    #[serde(default = "default_http_request_credential_header_name")]
+    pub header_name: String,
+    /// Environment variable containing the secret/token value
+    #[serde(default)]
+    pub env_var: String,
+    /// Optional prefix prepended to the secret (for example `Bearer `)
+    #[serde(default = "default_http_request_credential_value_prefix")]
+    pub value_prefix: String,
+}
+
+impl Default for HttpRequestCredentialProfile {
+    fn default() -> Self {
+        Self {
+            header_name: default_http_request_credential_header_name(),
+            env_var: String::new(),
+            value_prefix: default_http_request_credential_value_prefix(),
+        }
+    }
+}
+
+fn default_http_request_credential_header_name() -> String {
+    "Authorization".into()
+}
+
+fn default_http_request_credential_value_prefix() -> String {
+    "Bearer ".into()
+}
+
 /// HTTP request tool configuration (`[http_request]` section).
 ///
 /// Domain filtering: `allowed_domains` controls which hosts are reachable (use `["*"]`
@@ -2715,6 +2759,12 @@ pub struct HttpRequestConfig {
     /// Default: false (deny private hosts for SSRF protection).
     #[serde(default)]
     pub allow_private_hosts: bool,
+    /// Optional named credential profiles for env-backed auth injection.
+    ///
+    /// Each profile resolves a secret from an environment variable and injects
+    /// it as a request header. The agent selects a profile by name at call time.
+    #[serde(default)]
+    pub credential_profiles: HashMap<String, HttpRequestCredentialProfile>,
 }
 
 impl Default for HttpRequestConfig {
@@ -2725,6 +2775,7 @@ impl Default for HttpRequestConfig {
             max_response_size: default_http_max_response_size(),
             timeout_secs: default_http_timeout_secs(),
             allow_private_hosts: false,
+            credential_profiles: HashMap::new(),
         }
     }
 }
