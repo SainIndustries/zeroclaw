@@ -8,13 +8,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
-use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
-};
-
-/// Discord approval button custom_id prefixes.
-const DISCORD_APPROVAL_APPROVE_PREFIX: &str = "zcapr:yes:";
-const DISCORD_APPROVAL_DENY_PREFIX: &str = "zcapr:no:";
+use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 /// Discord channel — connects via Gateway WebSocket for real-time messages
 pub struct DiscordChannel {
@@ -44,16 +38,6 @@ pub struct DiscordChannel {
     multi_message_thread_ts: Mutex<HashMap<String, Option<String>>>,
     /// Stall-watchdog timeout in seconds (0 = disabled).
     stall_timeout_secs: u64,
-    /// Pending interactive tool-approval requests: request UUID → oneshot sender.
-    pending_approvals: std::sync::Arc<
-        tokio::sync::Mutex<
-            HashMap<String, tokio::sync::oneshot::Sender<ChannelApprovalResponse>>,
-        >,
-    >,
-    /// How long (seconds) to wait for the operator to tap Approve/Deny before
-    /// auto-denying. Configurable via `channels.discord.approval_timeout_secs`.
-    /// Default: 120.
-    approval_timeout_secs: u64,
 }
 
 impl DiscordChannel {
@@ -81,15 +65,7 @@ impl DiscordChannel {
             multi_message_sent_len: Mutex::new(HashMap::new()),
             multi_message_thread_ts: Mutex::new(HashMap::new()),
             stall_timeout_secs: 0,
-            pending_approvals: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            approval_timeout_secs: 120,
         }
-    }
-
-    /// Override the approval prompt timeout (default 120s).
-    pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
-        self.approval_timeout_secs = secs;
-        self
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
@@ -793,66 +769,6 @@ fn normalize_incoming_content(
     Some(normalized)
 }
 
-fn parse_approval_request_id(custom_id: &str, prefix: &str) -> Option<String> {
-    let raw = custom_id.strip_prefix(prefix)?.trim();
-    if raw.is_empty() || raw.chars().any(char::is_whitespace) {
-        return None;
-    }
-    Some(raw.to_string())
-}
-
-/// Parse a Discord `INTERACTION_CREATE` message-component event and return
-/// the approval ID and decision (true=approve, false=deny), or None if the
-/// event is not a recognized approval button interaction.
-fn try_parse_approval_button(d: &serde_json::Value) -> Option<(String, bool)> {
-    // type=3 => MessageComponent interaction
-    let interaction_type = d.get("type").and_then(serde_json::Value::as_u64)?;
-    if interaction_type != 3 {
-        return None;
-    }
-
-    let custom_id = d
-        .get("data")
-        .and_then(|data| data.get("custom_id"))
-        .and_then(serde_json::Value::as_str)?;
-
-    if let Some(request_id) = parse_approval_request_id(custom_id, DISCORD_APPROVAL_APPROVE_PREFIX)
-    {
-        Some((request_id, true))
-    } else if let Some(request_id) =
-        parse_approval_request_id(custom_id, DISCORD_APPROVAL_DENY_PREFIX)
-    {
-        Some((request_id, false))
-    } else {
-        None
-    }
-}
-
-/// ACK an interaction by editing the original message and removing its buttons.
-fn acknowledge_interaction_nonblocking(
-    client: reqwest::Client,
-    interaction_id: String,
-    interaction_token: String,
-    approved: bool,
-) {
-    let decision_text = if approved { "Approved" } else { "Denied" };
-    let emoji = if approved { "\u{2705}" } else { "\u{274c}" };
-
-    tokio::spawn(async move {
-        let url = format!(
-            "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
-        );
-        let body = json!({
-            "type": 7,
-            "data": {
-                "content": format!("{emoji} {decision_text}."),
-                "components": []
-            }
-        });
-        let _ = client.post(&url).json(&body).send().await;
-    });
-}
-
 /// Minimal base64 decode (no extra dep) — only needs to decode the user ID portion
 #[allow(clippy::cast_possible_truncation)]
 fn base64_decode(input: &str) -> Option<String> {
@@ -1166,58 +1082,8 @@ impl Channel for DiscordChannel {
                         _ => {}
                     }
 
+                    // Only handle MESSAGE_CREATE (opcode 0, type "MESSAGE_CREATE")
                     let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");
-
-                    // Handle button interaction callbacks for tool approvals.
-                    if event_type == "INTERACTION_CREATE" {
-                        if let Some(d) = event.get("d") {
-                            let interaction_id = d
-                                .get("id")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            let interaction_token = d
-                                .get("token")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
-
-                            if let Some((request_id, approved)) = try_parse_approval_button(d) {
-                                // Look up and resolve the pending approval.
-                                let sender_opt = self
-                                    .pending_approvals
-                                    .lock()
-                                    .await
-                                    .remove(&request_id);
-
-                                if let Some(sender) = sender_opt {
-                                    let response = if approved {
-                                        ChannelApprovalResponse::Approve
-                                    } else {
-                                        ChannelApprovalResponse::Deny
-                                    };
-                                    let _ = sender.send(response);
-                                    acknowledge_interaction_nonblocking(
-                                        self.http_client(),
-                                        interaction_id,
-                                        interaction_token,
-                                        approved,
-                                    );
-                                } else {
-                                    // No pending approval for this ID (already resolved or expired).
-                                    acknowledge_interaction_nonblocking(
-                                        self.http_client(),
-                                        interaction_id,
-                                        interaction_token,
-                                        false,
-                                    );
-                                }
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Only handle MESSAGE_CREATE
                     if event_type != "MESSAGE_CREATE" {
                         continue;
                     }
@@ -1371,94 +1237,6 @@ impl Channel for DiscordChannel {
         }
 
         Ok(())
-    }
-
-    async fn request_approval(
-        &self,
-        recipient: &str,
-        request: &ChannelApprovalRequest,
-    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
-        // Generate a unique ID embedded in the button custom_id.
-        let request_id = uuid::Uuid::new_v4().to_string();
-
-        let raw_args = &request.arguments_summary;
-        let args_preview = if raw_args.chars().count() > 260 {
-            crate::util::truncate_with_ellipsis(raw_args, 260)
-        } else {
-            raw_args.clone()
-        };
-
-        let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
-        let body = json!({
-            "content": format!(
-                "**Approval required** for tool `{tool}`.\nArgs: `{args}`",
-                tool = request.tool_name,
-                args = args_preview,
-            ),
-            "components": [{
-                "type": 1,
-                "components": [
-                    {
-                        "type": 2,
-                        "style": 3,
-                        "label": "Approve",
-                        "custom_id": format!("{DISCORD_APPROVAL_APPROVE_PREFIX}{request_id}")
-                    },
-                    {
-                        "type": 2,
-                        "style": 4,
-                        "label": "Deny",
-                        "custom_id": format!("{DISCORD_APPROVAL_DENY_PREFIX}{request_id}")
-                    }
-                ]
-            }]
-        });
-
-        // Register the oneshot BEFORE sending so we don't miss a fast tap.
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(request_id.clone(), tx);
-
-        let resp = self
-            .http_client()
-            .post(&url)
-            .header("Authorization", format!("Bot {}", self.bot_token))
-            .json(&body)
-            .send()
-            .await;
-
-        match resp {
-            Ok(r) if r.status().is_success() => {}
-            Ok(r) => {
-                self.pending_approvals.lock().await.remove(&request_id);
-                let status = r.status();
-                let err = r.text().await.unwrap_or_default();
-                let sanitized = zeroclaw_providers::sanitize_api_error(&err);
-                anyhow::bail!("Discord approval prompt failed ({status}): {sanitized}");
-            }
-            Err(e) => {
-                self.pending_approvals.lock().await.remove(&request_id);
-                return Err(e.into());
-            }
-        }
-
-        // Wait for the operator to tap a button. Timeout → auto-deny.
-        let result = match tokio::time::timeout(
-            std::time::Duration::from_secs(self.approval_timeout_secs),
-            rx,
-        )
-        .await
-        {
-            Ok(Ok(response)) => Some(response),
-            _ => {
-                self.pending_approvals.lock().await.remove(&request_id);
-                Some(ChannelApprovalResponse::Deny)
-            }
-        };
-
-        Ok(result)
     }
 
     async fn health_check(&self) -> bool {
@@ -2668,83 +2446,5 @@ mod tests {
     fn split_message_for_discord_multi_empty_input() {
         let chunks = split_message_for_discord_multi("", 2000);
         assert!(chunks.is_empty());
-    }
-
-    // ── Discord approval button parsing tests ────────────────────────────────
-
-    #[test]
-    fn discord_parse_approval_button_approve() {
-        let event = json!({
-            "type": 3,
-            "id": "111222333",
-            "token": "fake_token",
-            "data": { "custom_id": "zcapr:yes:req-42" },
-            "member": { "user": { "id": "user_1" } },
-            "channel_id": "chan_99"
-        });
-
-        let (request_id, approved) =
-            try_parse_approval_button(&event).expect("approval button should parse");
-        assert_eq!(request_id, "req-42");
-        assert!(approved);
-    }
-
-    #[test]
-    fn discord_parse_approval_button_deny() {
-        let event = json!({
-            "type": 3,
-            "id": "444555666",
-            "token": "tok",
-            "data": { "custom_id": "zcapr:no:req-99" },
-            "user": { "id": "dm_user" },
-            "channel_id": ""
-        });
-
-        let (request_id, approved) =
-            try_parse_approval_button(&event).expect("deny button should parse");
-        assert_eq!(request_id, "req-99");
-        assert!(!approved);
-    }
-
-    #[test]
-    fn discord_parse_approval_button_ignores_non_approval() {
-        let event = json!({
-            "type": 3,
-            "id": "777",
-            "token": "tok",
-            "data": { "custom_id": "some_other_button" },
-            "member": { "user": { "id": "user_1" } },
-            "channel_id": "chan_1"
-        });
-
-        assert!(try_parse_approval_button(&event).is_none());
-    }
-
-    #[test]
-    fn discord_parse_approval_button_ignores_non_component() {
-        let event = json!({
-            "type": 2,
-            "id": "888",
-            "token": "tok",
-            "data": { "custom_id": "zcapr:yes:req-1" },
-            "member": { "user": { "id": "user_1" } },
-            "channel_id": "chan_1"
-        });
-
-        assert!(try_parse_approval_button(&event).is_none());
-    }
-
-    #[test]
-    fn discord_parse_approval_button_rejects_whitespace_request_id() {
-        let event = json!({
-            "type": 3,
-            "id": "999",
-            "token": "tok",
-            "data": { "custom_id": "zcapr:yes:req 1" },
-            "member": { "user": { "id": "user_1" } },
-            "channel_id": "chan_1"
-        });
-
-        assert!(try_parse_approval_button(&event).is_none());
     }
 }
