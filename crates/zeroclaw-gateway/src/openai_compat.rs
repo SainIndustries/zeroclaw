@@ -187,6 +187,11 @@ pub async fn handle_chat_completions(
         // task above drains evt_rx concurrently. turn_streamed takes
         // ownership of evt_tx and drops it on return, signalling the
         // forwarder's while-let loop to exit once drained.
+        // Note: state.session_queue is intentionally NOT acquired here.
+        // Aura serializes requests per session_id at the webhook layer
+        // (one channel partner = one in-flight request at a time). If we
+        // ever observe interleaved turns on the same session in production,
+        // add session_queue.acquire(&session_key).await before turn_streamed.
         let result = agent.turn_streamed(&user_message_drv, evt_tx).await;
 
         // Wait for the forwarder to fully drain queued TurnEvents into
@@ -236,6 +241,10 @@ pub async fn handle_chat_completions(
                         "openai_compat: failed to persist assistant message"
                     );
                 }
+                // Note: backend.set_session_state is intentionally NOT called here.
+                // Aura tracks turn state (idle/running/error) in its own webapp DB
+                // for UI indicators; the gateway-side session_state column is left
+                // untouched on the OpenAI-compat path.
             }
 
             // Fire-and-forget memory consolidation, mirroring ws::process_chat_message.
@@ -275,8 +284,10 @@ async fn handle_non_streaming(
     state: AppState,
     model: String,
     user_message: String,
-    _session_id: Option<String>,
+    session_id: Option<String>,
 ) -> Result<Response, (StatusCode, String)> {
+    let session_key = session_id.as_ref().map(|id| format!("gw_{id}"));
+
     let config = state.config.lock().clone();
     let mut agent = zeroclaw_runtime::agent::Agent::from_config(&config)
         .await
@@ -288,6 +299,29 @@ async fn handle_non_streaming(
             )
         })?;
 
+    if let Some(ref id) = session_id {
+        agent.set_memory_session_id(Some(id.clone()));
+    }
+
+    if let (Some(backend), Some(key)) =
+        (state.session_backend.as_ref(), session_key.as_ref())
+    {
+        let prior = backend.load(key);
+        if !prior.is_empty() {
+            tracing::debug!(
+                session_key = %key,
+                prior_count = prior.len(),
+                "openai_compat (non-stream): seeding agent with prior history"
+            );
+            agent.seed_history(&prior);
+        }
+    }
+
+    // Note: state.session_queue is intentionally NOT acquired here.
+    // Aura serializes requests per session_id at the webhook layer
+    // (one channel partner = one in-flight request at a time). If we
+    // ever observe interleaved turns on the same session in production,
+    // add session_queue.acquire(&session_key).await before turn_streamed.
     let response_text = agent.turn(&user_message).await.map_err(|e| {
         tracing::warn!(error = %e, "non-streaming /v1/chat/completions turn error");
         (
@@ -296,7 +330,31 @@ async fn handle_non_streaming(
         )
     })?;
 
-    // Fire-and-forget memory consolidation, mirroring the streaming path.
+    if let (Some(backend), Some(key)) =
+        (state.session_backend.as_ref(), session_key.as_ref())
+    {
+        let user_msg = zeroclaw_api::provider::ChatMessage::user(user_message.clone());
+        if let Err(e) = backend.append(key, &user_msg) {
+            tracing::warn!(
+                session_key = %key,
+                error = %e,
+                "openai_compat (non-stream): failed to persist user message"
+            );
+        }
+        let assistant_msg = zeroclaw_api::provider::ChatMessage::assistant(response_text.clone());
+        if let Err(e) = backend.append(key, &assistant_msg) {
+            tracing::warn!(
+                session_key = %key,
+                error = %e,
+                "openai_compat (non-stream): failed to persist assistant message"
+            );
+        }
+        // Note: backend.set_session_state is intentionally NOT called here.
+        // Aura tracks turn state (idle/running/error) in its own webapp DB
+        // for UI indicators; the gateway-side session_state column is left
+        // untouched on the OpenAI-compat path.
+    }
+
     if state.auto_save {
         let mem = state.mem.clone();
         let provider = state.provider.clone();
@@ -582,6 +640,16 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-aura-session-id", "   ".parse().unwrap());
         assert_eq!(read_session_id(&headers), None);
+    }
+
+    #[test]
+    fn session_key_format_matches_design() {
+        // Wire-contract test: the session_key prefix is "gw_" (single
+        // underscore, lowercase) as agreed in the design spec
+        // (docs/superpowers/specs/2026-04-24-unified-conversation-architecture-design.md).
+        // Aura webhooks send the bare session_id; the adapter prepends "gw_".
+        let id = "imsg_abc123";
+        assert_eq!(format!("gw_{id}"), "gw_imsg_abc123");
     }
 
     #[test]
