@@ -1765,6 +1765,30 @@ mod tests {
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
 
+    #[test]
+    fn require_auth_rejects_missing_header_when_secret_configured() {
+        // Regression guard: if the !secret.is_empty() check in require_auth is
+        // ever removed AND aura_internal_secret is set to Some(""), an absent
+        // Authorization header would silently authorize (extract_bearer_token
+        // returns None -> "" via unwrap_or). Pin the contract: no header = 401,
+        // even when a secret is configured.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let pairing = Arc::new(PairingGuard::new(true, &[]));
+        let state = test_state_with_auth(config, pairing, Some("super-secret".to_string()));
+
+        // No Authorization header at all
+        let headers = HeaderMap::new();
+
+        let err =
+            require_auth(&state, &headers).expect_err("missing header must be rejected");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
     async fn response_json(response: axum::response::Response) -> serde_json::Value {
         let body = response
             .into_body()
