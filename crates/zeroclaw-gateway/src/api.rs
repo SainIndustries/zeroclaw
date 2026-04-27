@@ -31,6 +31,16 @@ pub(super) fn require_auth(
     }
 
     let token = extract_bearer_token(headers).unwrap_or("");
+
+    // Accept AURA_INTERNAL_SECRET as a bearer token (env-derived, mirrors
+    // openai_compat.rs::authorize). Lets the Aura webapp call /api/sessions/*
+    // with the same secret it uses for /v1/chat/completions.
+    if let Some(ref secret) = state.aura_internal_secret {
+        if !secret.is_empty() && token == secret {
+            return Ok(());
+        }
+    }
+
     if state.pairing.is_authenticated(token) {
         Ok(())
     } else {
@@ -2014,6 +2024,16 @@ mod tests {
     }
 
     fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
+        test_state_with_auth(config, Arc::new(PairingGuard::new(false, &[])), None)
+    }
+
+    /// Build a test AppState with explicit pairing + AURA_INTERNAL_SECRET overrides.
+    /// Used by `require_auth` tests that need to exercise the auth-shim logic.
+    fn test_state_with_auth(
+        config: zeroclaw_config::schema::Config,
+        pairing: Arc<PairingGuard>,
+        aura_internal_secret: Option<String>,
+    ) -> AppState {
         AppState {
             config: Arc::new(RwLock::new(config)),
             model_provider: Arc::new(MockModelProvider),
@@ -2022,7 +2042,7 @@ mod tests {
             mem: Arc::new(MockMemory),
             auto_save: false,
             webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing,
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
@@ -2061,10 +2081,74 @@ mod tests {
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             reload_tx: None,
-            aura_internal_secret: None,
+            aura_internal_secret,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
+    }
+
+    /// Helper: build a HeaderMap with a Bearer authorization header.
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn require_auth_accepts_aura_internal_secret() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let state = test_state_with_auth(
+            config,
+            Arc::new(PairingGuard::new(true, &[])),
+            Some("super-secret".to_string()),
+        );
+        let headers = bearer_headers("super-secret");
+        assert!(require_auth(&state, &headers).is_ok());
+    }
+
+    #[test]
+    fn require_auth_rejects_wrong_secret() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let state = test_state_with_auth(
+            config,
+            Arc::new(PairingGuard::new(true, &[])),
+            Some("super-secret".to_string()),
+        );
+        let headers = bearer_headers("wrong-secret");
+        let err = require_auth(&state, &headers).expect_err("wrong secret must be rejected");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_auth_falls_through_to_paired_token_when_secret_unset() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let state = test_state_with_auth(
+            config,
+            Arc::new(PairingGuard::new(true, &[])),
+            None,
+        );
+        let headers = bearer_headers("not-a-paired-token");
+        let err = require_auth(&state, &headers)
+            .expect_err("unpaired token without secret must be rejected");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
 
     async fn response_json(response: axum::response::Response) -> serde_json::Value {
