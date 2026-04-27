@@ -321,7 +321,7 @@ async fn handle_non_streaming(
     // Aura serializes requests per session_id at the webhook layer
     // (one channel partner = one in-flight request at a time). If we
     // ever observe interleaved turns on the same session in production,
-    // add session_queue.acquire(&session_key).await before turn_streamed.
+    // add session_queue.acquire(&session_key).await before agent.turn.
     let response_text = agent.turn(&user_message).await.map_err(|e| {
         tracing::warn!(error = %e, "non-streaming /v1/chat/completions turn error");
         (
