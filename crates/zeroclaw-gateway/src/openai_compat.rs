@@ -84,8 +84,12 @@ pub async fn handle_chat_completions(
             "no user message found in messages".to_string(),
         ))?;
 
+    // Read optional session id BEFORE moving headers into anything.
+    let session_id = read_session_id(&headers);
+    let session_key = session_id.as_ref().map(|id| format!("gw_{id}"));
+
     if !req.stream {
-        return handle_non_streaming(state, req.model, user_message).await;
+        return handle_non_streaming(state, req.model, user_message, session_id).await;
     }
 
     let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
@@ -128,6 +132,11 @@ pub async fn handle_chat_completions(
         }
     });
 
+    // Capture references to move into the driver task.
+    let user_message_drv = user_message.clone();
+    let session_id_drv = session_id.clone();
+    let session_key_drv = session_key.clone();
+
     // ── Driver task: create agent, run turn, emit terminal frames ────────────
     tokio::spawn(async move {
         // Mirror ws::handle_socket: build an Agent from the current config.
@@ -150,11 +159,35 @@ pub async fn handle_chat_completions(
             }
         };
 
+        // Scope memory consolidation to this session (Daily/Core fact rows
+        // tagged with the same session_id). When None, falls back to the
+        // agent's default "no session" memory bucket (today's behavior).
+        if let Some(ref id) = session_id_drv {
+            agent.set_memory_session_id(Some(id.clone()));
+        }
+
+        // Seed prior turns from SqliteSessionBackend so the agent has
+        // continuity within the conversation. Skipped silently if either
+        // the backend is disabled (config) or no session header was sent.
+        if let (Some(backend), Some(key)) =
+            (&state.session_backend, &session_key_drv)
+        {
+            let prior = backend.load(key);
+            if !prior.is_empty() {
+                tracing::debug!(
+                    session_key = %key,
+                    prior_count = prior.len(),
+                    "openai_compat: seeding agent with prior history"
+                );
+                agent.seed_history(&prior);
+            }
+        }
+
         // Run the agent turn, streaming events into evt_tx. The forwarder
         // task above drains evt_rx concurrently. turn_streamed takes
         // ownership of evt_tx and drops it on return, signalling the
         // forwarder's while-let loop to exit once drained.
-        let result = agent.turn_streamed(&user_message, evt_tx).await;
+        let result = agent.turn_streamed(&user_message_drv, evt_tx).await;
 
         // Wait for the forwarder to fully drain queued TurnEvents into
         // out_tx before we emit finish + [DONE]. Without this join, the
@@ -181,13 +214,36 @@ pub async fn handle_chat_completions(
             .await;
         let _ = out_tx.send(SseFrame::Done).await;
 
-        // Fire-and-forget memory consolidation, mirroring ws::process_chat_message.
-        if let Ok(response) = result {
+        if let Ok(ref response) = result {
+            // Persist user + assistant to the session backend if a session
+            // key was provided and the backend is configured.
+            if let (Some(backend), Some(key)) =
+                (state.session_backend.as_ref(), session_key_drv.as_ref())
+            {
+                let user_msg = zeroclaw_api::provider::ChatMessage::user(user_message_drv.clone());
+                if let Err(e) = backend.append(key, &user_msg) {
+                    tracing::warn!(
+                        session_key = %key,
+                        error = %e,
+                        "openai_compat: failed to persist user message"
+                    );
+                }
+                let assistant_msg = zeroclaw_api::provider::ChatMessage::assistant(response.clone());
+                if let Err(e) = backend.append(key, &assistant_msg) {
+                    tracing::warn!(
+                        session_key = %key,
+                        error = %e,
+                        "openai_compat: failed to persist assistant message"
+                    );
+                }
+            }
+
+            // Fire-and-forget memory consolidation, mirroring ws::process_chat_message.
             if state.auto_save {
                 let mem = state.mem.clone();
                 let provider = state.provider.clone();
                 let model_consolidate = model.clone();
-                let user_msg = user_message.clone();
+                let user_msg = user_message_drv.clone();
                 let assistant_resp = response.clone();
                 tokio::spawn(async move {
                     if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
@@ -219,6 +275,7 @@ async fn handle_non_streaming(
     state: AppState,
     model: String,
     user_message: String,
+    _session_id: Option<String>,
 ) -> Result<Response, (StatusCode, String)> {
     let config = state.config.lock().clone();
     let mut agent = zeroclaw_runtime::agent::Agent::from_config(&config)
