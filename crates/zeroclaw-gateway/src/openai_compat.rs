@@ -283,6 +283,22 @@ async fn handle_non_streaming(
     Ok(Json(body).into_response())
 }
 
+/// Extract the `X-Aura-Session-Id` header value, if present and non-empty.
+///
+/// Aura sets this header on every channel-mediated request (iMessage,
+/// dashboard, Slack, voice). When present, the adapter scopes both
+/// session-history persistence and the agent's memory_session_id to this
+/// value (prefixed with `gw_`). When absent, the adapter falls back to
+/// today's stateless "fresh agent per request" behavior.
+fn read_session_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-aura-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
 /// Validate the `Authorization: Bearer <token>` header.
 ///
 /// Accepts two token classes in order:
@@ -483,6 +499,32 @@ mod tests {
         );
         assert_eq!(frames[0]["choices"][0]["delta"]["tool_result"]["name"], "shell");
         assert_eq!(frames[0]["choices"][0]["delta"]["tool_result"]["output"], "hi\n");
+    }
+
+    #[test]
+    fn read_session_id_returns_some_when_header_present() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-aura-session-id",
+            "imsg_abc123def456".parse().unwrap(),
+        );
+        assert_eq!(
+            read_session_id(&headers),
+            Some("imsg_abc123def456".to_string())
+        );
+    }
+
+    #[test]
+    fn read_session_id_returns_none_when_header_absent() {
+        let headers = HeaderMap::new();
+        assert_eq!(read_session_id(&headers), None);
+    }
+
+    #[test]
+    fn read_session_id_trims_whitespace_and_rejects_empty() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-aura-session-id", "   ".parse().unwrap());
+        assert_eq!(read_session_id(&headers), None);
     }
 
     #[test]
