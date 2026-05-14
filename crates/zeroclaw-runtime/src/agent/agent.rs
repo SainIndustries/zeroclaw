@@ -574,6 +574,9 @@ impl Agent {
                 if config.hooks.builtin.command_logger {
                     runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
                 }
+                if config.hooks.builtin.usage_reporter {
+                    runner.register(Box::new(crate::hooks::builtin::UsageReporterHook::new()));
+                }
                 if config.hooks.builtin.webhook_audit.enabled {
                     runner.register(Box::new(crate::hooks::builtin::WebhookAuditHook::new(
                         config.hooks.builtin.webhook_audit.clone(),
@@ -926,6 +929,10 @@ impl Agent {
                 Ok(resp) => resp,
                 Err(err) => return Err(err),
             };
+
+            if let Some(ref hooks) = self.hook_runner {
+                hooks.fire_llm_output(&response).await?;
+            }
 
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
             if calls.is_empty() {

@@ -34,7 +34,9 @@ pub trait HookHandler: Send + Sync {
     async fn on_session_start(&self, _session_id: &str, _channel: &str) {}
     async fn on_session_end(&self, _session_id: &str, _channel: &str) {}
     async fn on_llm_input(&self, _messages: &[ChatMessage], _model: &str) {}
-    async fn on_llm_output(&self, _response: &ChatResponse) {}
+    async fn on_llm_output(&self, _response: &ChatResponse) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn on_after_tool_call(&self, _tool: &str, _result: &ToolResult, _duration: Duration) {}
     async fn on_message_sent(&self, _channel: &str, _recipient: &str, _content: &str) {}
     async fn on_heartbeat_tick(&self) {}

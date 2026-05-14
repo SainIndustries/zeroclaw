@@ -1195,6 +1195,10 @@ pub async fn run_tool_call_loop(
                     output_tokens: resp_output_tokens,
                 });
 
+                if let Some(hooks) = hooks {
+                    hooks.fire_llm_output(&resp).await?;
+                }
+
                 // Record cost via task-local tracker (no-op when not scoped)
                 let _ = resp
                     .usage

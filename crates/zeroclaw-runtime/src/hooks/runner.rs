@@ -86,13 +86,16 @@ impl HookRunner {
         join_all(futs).await;
     }
 
-    pub async fn fire_llm_output(&self, response: &ChatResponse) {
+    pub async fn fire_llm_output(&self, response: &ChatResponse) -> anyhow::Result<()> {
         let futs: Vec<_> = self
             .handlers
             .iter()
-            .map(|h| h.on_llm_output(response))
+            .map(|h| async move { (h.name().to_string(), h.on_llm_output(response).await) })
             .collect();
-        join_all(futs).await;
+        for (name, result) in join_all(futs).await {
+            result.map_err(|error| anyhow::anyhow!("LLM output hook {name} failed: {error}"))?;
+        }
+        Ok(())
     }
 
     pub async fn fire_after_tool_call(&self, tool: &str, result: &ToolResult, duration: Duration) {
