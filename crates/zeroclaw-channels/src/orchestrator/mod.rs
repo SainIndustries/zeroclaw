@@ -1350,6 +1350,30 @@ fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
     zeroclaw_providers::reliable::is_non_retryable(error)
 }
 
+fn channel_user_error_message(error: &anyhow::Error) -> String {
+    if error
+        .downcast_ref::<zeroclaw_providers::ProviderCapabilityError>()
+        .is_some()
+    {
+        return format!("⚠️ Error: {error}");
+    }
+
+    let error_text = error.to_string();
+    let provider_internal_error = error_text.contains("All providers/models failed")
+        || error_text.contains("API error")
+        || error_text.contains("non_retryable")
+        || error_text.contains("non__retryable")
+        || error_text.contains("toolResult blocks")
+        || error_text.contains("toolUse blocks");
+
+    if provider_internal_error {
+        "I hit a temporary model formatting issue, but I’m ready to continue. Please try that again."
+            .to_string()
+    } else {
+        format!("⚠️ Error: {error}")
+    }
+}
+
 fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
     if zeroclaw_memory::is_assistant_autosave_key(key) {
         return true;
@@ -3477,14 +3501,15 @@ async fn process_channel_message(
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
+                    let user_error = channel_user_error_message(&e);
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
+                            .finalize_draft(&msg.reply_target, draft_id, &user_error)
                             .await;
                     } else {
                         let _ = channel
                             .send(
-                                &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
+                                &SendMessage::new(user_error, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await;
@@ -10949,8 +10974,17 @@ This is an example JSON object for profile settings."#;
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 2, "expected one error and one successful reply");
         assert!(
-            sent[0].contains("Format Error"),
-            "first reply must mention the request format error, got: {}",
+            sent[0].contains(
+                "I hit a temporary model formatting issue, but I’m ready to continue. Please try that again."
+            ),
+            "first reply must use the customer-safe provider error, got: {}",
+            sent[0]
+        );
+        assert!(
+            !sent[0].contains("All providers/models failed")
+                && !sent[0].contains("Format Error")
+                && !sent[0].contains("request_id"),
+            "first reply must not expose provider internals, got: {}",
             sent[0]
         );
         assert!(

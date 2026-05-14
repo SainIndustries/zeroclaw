@@ -173,9 +173,7 @@ impl AwsCredentials {
             .to_string();
         let secret_access_key = creds_json["SecretAccessKey"]
             .as_str()
-            .ok_or_else(|| {
-                anyhow::anyhow!("Missing SecretAccessKey in ECS credential response")
-            })?
+            .ok_or_else(|| anyhow::anyhow!("Missing SecretAccessKey in ECS credential response"))?
             .to_string();
         let session_token = creds_json["Token"].as_str().map(|s| s.to_string());
 
@@ -761,33 +759,41 @@ impl BedrockProvider {
                     }
                 }
                 "tool" => {
+                    let pending_ids =
+                        Self::pending_tool_use_ids_for_next_tool_result(&converse_messages);
+                    let tool_use_id = Self::extract_tool_call_id(&msg.content)
+                        .or_else(|| pending_ids.first().cloned());
+
+                    let Some(tool_use_id) = tool_use_id else {
+                        tracing::warn!(
+                            "Tool result has no preceding Bedrock toolUse; replaying as text"
+                        );
+                        converse_messages.push(Self::tool_message_as_text(&msg.content));
+                        continue;
+                    };
+
+                    if !pending_ids.contains(&tool_use_id) {
+                        tracing::warn!(
+                            tool_use_id,
+                            "Tool result does not match a pending Bedrock toolUse; replaying as text"
+                        );
+                        converse_messages.push(Self::tool_message_as_text(&msg.content));
+                        continue;
+                    }
+
                     let tool_result_msg = Self::parse_tool_result_message(&msg.content)
                         .unwrap_or_else(|| {
-                            // Fallback: always emit a toolResult block so the
-                            // Bedrock API contract (every toolUse needs a matching
-                            // toolResult) is never violated.
-                            let tool_use_id = Self::extract_tool_call_id(&msg.content)
-                                .or_else(|| Self::last_pending_tool_use_id(&converse_messages))
-                                .unwrap_or_else(|| "unknown".to_string());
-
                             tracing::warn!(
                                 "Failed to parse tool result message, creating error \
                                  toolResult for tool_use_id={}",
                                 tool_use_id
                             );
 
-                            ConverseMessage {
-                                role: "user".to_string(),
-                                content: vec![ContentBlock::ToolResult(ToolResultWrapper {
-                                    tool_result: ToolResultBlock {
-                                        tool_use_id,
-                                        content: vec![ToolResultContent {
-                                            text: msg.content.clone(),
-                                        }],
-                                        status: "error".to_string(),
-                                    },
-                                })],
-                            }
+                            Self::tool_result_message(
+                                tool_use_id,
+                                msg.content.clone(),
+                                "error".to_string(),
+                            )
                         });
 
                     // Merge consecutive tool results into a single user message.
@@ -855,41 +861,81 @@ impl BedrockProvider {
             .map(String::from)
     }
 
-    /// Find the first unmatched tool_use_id from the last assistant message.
+    /// Return tool_use_ids that may legally be answered by the next tool result.
     ///
-    /// When a tool result can't be parsed at all (not even the ID), we fall
-    /// back to matching it against the preceding assistant turn's toolUse
-    /// blocks that don't yet have a corresponding toolResult.
-    fn last_pending_tool_use_id(converse_messages: &[ConverseMessage]) -> Option<String> {
-        let last_assistant = converse_messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "assistant")?;
+    /// Bedrock requires toolResult blocks to answer toolUse blocks from the
+    /// immediately previous assistant turn. Replaying stale or duplicate tool
+    /// results as structured toolResult blocks causes 400s like:
+    /// "toolResult blocks ... exceeds the number of toolUse blocks".
+    fn pending_tool_use_ids_for_next_tool_result(
+        converse_messages: &[ConverseMessage],
+    ) -> Vec<String> {
+        let Some(last) = converse_messages.last() else {
+            return Vec::new();
+        };
 
-        let tool_use_ids: Vec<&str> = last_assistant
+        let (assistant, answered_ids): (&ConverseMessage, Vec<&str>) = if last.role == "assistant" {
+            (last, Vec::new())
+        } else if last.role == "user"
+            && last
+                .content
+                .iter()
+                .all(|b| matches!(b, ContentBlock::ToolResult(_)))
+        {
+            let Some(assistant) = converse_messages
+                .iter()
+                .rev()
+                .nth(1)
+                .filter(|m| m.role == "assistant")
+            else {
+                return Vec::new();
+            };
+            let answered_ids = last
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolResult(wrapper) => {
+                        Some(wrapper.tool_result.tool_use_id.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            (assistant, answered_ids)
+        } else {
+            return Vec::new();
+        };
+
+        assistant
             .content
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::ToolUse(wrapper) => Some(wrapper.tool_use.tool_use_id.as_str()),
+                ContentBlock::ToolUse(wrapper) => Some(wrapper.tool_use.tool_use_id.clone()),
                 _ => None,
             })
-            .collect();
+            .filter(|id| !answered_ids.contains(&id.as_str()))
+            .collect()
+    }
 
-        let answered_ids: Vec<&str> = converse_messages
-            .iter()
-            .rev()
-            .take_while(|m| m.role == "user")
-            .flat_map(|m| m.content.iter())
-            .filter_map(|b| match b {
-                ContentBlock::ToolResult(wrapper) => Some(wrapper.tool_result.tool_use_id.as_str()),
-                _ => None,
-            })
-            .collect();
+    fn tool_result_message(tool_use_id: String, text: String, status: String) -> ConverseMessage {
+        ConverseMessage {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult(ToolResultWrapper {
+                tool_result: ToolResultBlock {
+                    tool_use_id,
+                    content: vec![ToolResultContent { text }],
+                    status,
+                },
+            })],
+        }
+    }
 
-        tool_use_ids
-            .into_iter()
-            .find(|id| !answered_ids.contains(id))
-            .map(String::from)
+    fn tool_message_as_text(content: &str) -> ConverseMessage {
+        ConverseMessage {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text(TextBlock {
+                text: format!("[Tool result replayed as text]\n{content}"),
+            })],
+        }
     }
 
     /// Parse user message content, extracting [IMAGE:data:...] markers into image blocks.
@@ -1636,11 +1682,16 @@ mod tests {
     #[test]
     fn convert_messages_tool_role_to_tool_result() {
         let tool_json = r#"{"tool_call_id": "call_123", "content": "Result data"}"#;
-        let messages = vec![ChatMessage::tool(tool_json)];
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"call_123","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(tool_json),
+        ];
         let (_, msgs) = BedrockProvider::convert_messages(&messages);
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].role, "user");
-        assert!(matches!(msgs[0].content[0], ContentBlock::ToolResult(_)));
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1].role, "user");
+        assert!(matches!(msgs[1].content[0], ContentBlock::ToolResult(_)));
     }
 
     #[test]
@@ -1959,6 +2010,65 @@ mod tests {
     }
 
     #[test]
+    fn orphan_tool_result_replays_as_text() {
+        let messages = vec![
+            ChatMessage::user("hello"),
+            ChatMessage::tool(r#"{"tool_call_id":"stale","content":"old result"}"#),
+        ];
+        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1].role, "user");
+        assert!(
+            matches!(&msgs[1].content[0], ContentBlock::Text(_)),
+            "orphan tool results must not be sent as Bedrock toolResult blocks"
+        );
+    }
+
+    #[test]
+    fn duplicate_tool_result_replays_as_text_after_pending_use_answered() {
+        let messages = vec![
+            ChatMessage::user("do one thing"),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"t1","name":"a","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"t1","content":"result 1"}"#),
+            ChatMessage::tool(r#"{"tool_call_id":"t1","content":"duplicate result"}"#),
+        ];
+        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+
+        assert_eq!(msgs.len(), 4);
+        assert!(matches!(&msgs[2].content[0], ContentBlock::ToolResult(_)));
+        assert!(
+            matches!(&msgs[3].content[0], ContentBlock::Text(_)),
+            "duplicate tool results would exceed Bedrock's previous toolUse count"
+        );
+    }
+
+    #[test]
+    fn extra_tool_result_after_multi_tool_turn_replays_as_text() {
+        let messages = vec![
+            ChatMessage::user("do two things"),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"t1","name":"a","arguments":"{}"},{"id":"t2","name":"b","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"t1","content":"result 1"}"#),
+            ChatMessage::tool(r#"{"tool_call_id":"t2","content":"result 2"}"#),
+            ChatMessage::tool(r#"{"tool_call_id":"t3","content":"unexpected result"}"#),
+        ];
+        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[2].content.len(), 2);
+        assert!(matches!(&msgs[2].content[0], ContentBlock::ToolResult(_)));
+        assert!(matches!(&msgs[2].content[1], ContentBlock::ToolResult(_)));
+        assert!(
+            matches!(&msgs[3].content[0], ContentBlock::Text(_)),
+            "extra result should not merge into the structured toolResult turn"
+        );
+    }
+
+    #[test]
     fn extract_tool_call_id_tries_multiple_field_names() {
         assert_eq!(
             BedrockProvider::extract_tool_call_id(r#"{"tool_call_id":"a"}"#),
@@ -2048,7 +2158,8 @@ mod tests {
     #[test]
     fn resolve_ecs_endpoint_uses_relative_uri() {
         let _env_lock = env_lock();
-        let _rel_guard = EnvGuard::set("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", Some("/creds/abc"));
+        let _rel_guard =
+            EnvGuard::set("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", Some("/creds/abc"));
         let _full_guard = EnvGuard::set("AWS_CONTAINER_CREDENTIALS_FULL_URI", None);
         let _tok_guard = EnvGuard::set("AWS_CONTAINER_AUTHORIZATION_TOKEN", None);
 
@@ -2063,13 +2174,19 @@ mod tests {
     fn resolve_ecs_endpoint_uses_full_uri_with_auth() {
         let _env_lock = env_lock();
         let _rel_guard = EnvGuard::set("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", None);
-        let _full_guard = EnvGuard::set("AWS_CONTAINER_CREDENTIALS_FULL_URI", Some("https://10.0.0.1/custom/creds"));
+        let _full_guard = EnvGuard::set(
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            Some("https://10.0.0.1/custom/creds"),
+        );
         let _tok_guard = EnvGuard::set("AWS_CONTAINER_AUTHORIZATION_TOKEN", Some("mytoken"));
 
         let result = resolve_ecs_endpoint();
         assert_eq!(
             result,
-            Some(("https://10.0.0.1/custom/creds".to_string(), Some("mytoken".to_string())))
+            Some((
+                "https://10.0.0.1/custom/creds".to_string(),
+                Some("mytoken".to_string())
+            ))
         );
     }
 
