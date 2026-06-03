@@ -583,12 +583,9 @@ impl BedrockProvider {
         })
     }
 
-    /// Resolve credentials: use cached if available, otherwise fetch from IMDS.
+    /// Resolve credentials dynamically so ECS/Fargate task credentials can refresh.
     async fn resolve_credentials(&self) -> anyhow::Result<AwsCredentials> {
-        if let Ok(creds) = AwsCredentials::from_env() {
-            return Ok(creds);
-        }
-        AwsCredentials::from_imds().await
+        AwsCredentials::resolve().await
     }
 
     // ── Cache heuristics (same thresholds as AnthropicProvider) ──
