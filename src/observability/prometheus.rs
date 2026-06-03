@@ -448,6 +448,7 @@ mod tests {
             error_message: None,
             input_tokens: Some(100),
             output_tokens: Some(50),
+            usage_attribution: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             provider: "openrouter".into(),
@@ -457,6 +458,7 @@ mod tests {
             error_message: None,
             input_tokens: Some(200),
             output_tokens: Some(80),
+            usage_attribution: None,
         });
 
         let output = obs.encode();
@@ -483,6 +485,7 @@ mod tests {
             error_message: Some("timeout".into()),
             input_tokens: None,
             output_tokens: None,
+            usage_attribution: None,
         });
 
         let output = obs.encode();

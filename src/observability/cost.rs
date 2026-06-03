@@ -160,6 +160,7 @@ mod tests {
             error_message: None,
             input_tokens: Some(1000),
             output_tokens: Some(500),
+            usage_attribution: None,
         });
 
         let summary = tracker.get_summary().unwrap();
@@ -181,6 +182,7 @@ mod tests {
             error_message: Some("API error".into()),
             input_tokens: Some(1000),
             output_tokens: Some(500),
+            usage_attribution: None,
         });
 
         let summary = tracker.get_summary().unwrap();
@@ -200,6 +202,7 @@ mod tests {
             error_message: None,
             input_tokens: None,
             output_tokens: None,
+            usage_attribution: None,
         });
 
         let summary = tracker.get_summary().unwrap();
@@ -219,6 +222,7 @@ mod tests {
             error_message: None,
             input_tokens: Some(1_000_000), // 1M tokens
             output_tokens: Some(1_000_000),
+            usage_attribution: None,
         });
 
         let summary = tracker.get_summary().unwrap();
@@ -250,6 +254,7 @@ mod tests {
             error_message: None,
             input_tokens: Some(1_000_000),
             output_tokens: Some(0),
+            usage_attribution: None,
         });
 
         let summary = tracker.get_summary().unwrap();

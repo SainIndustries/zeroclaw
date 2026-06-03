@@ -615,6 +615,7 @@ fn record_success(
             error_message: None,
             input_tokens: None,
             output_tokens: None,
+            usage_attribution: None,
         });
     state
         .observer
@@ -638,6 +639,7 @@ fn record_failure(
             error_message: Some(error_message.to_string()),
             input_tokens: None,
             output_tokens: None,
+            usage_attribution: None,
         });
     state
         .observer

@@ -2,7 +2,7 @@ use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
-use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
+use crate::observability::{self, runtime_trace, LlmUsageAttribution, Observer, ObserverEvent};
 use crate::providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
 };
@@ -60,6 +60,18 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 20;
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+
+#[derive(Debug, Clone)]
+pub struct UsageAttributionContext {
+    pub channel: String,
+    pub source: String,
+    pub cron_job_id: Option<String>,
+    pub cron_job_name: Option<String>,
+}
+
+tokio::task_local! {
+    static USAGE_ATTRIBUTION_CONTEXT: Option<UsageAttributionContext>;
+}
 
 fn should_treat_provider_as_vision_capable(provider_name: &str, provider: &dyn Provider) -> bool {
     if provider.supports_vision() {
@@ -737,6 +749,40 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
         .await
 }
 
+fn default_usage_source(channel_name: &str) -> String {
+    match channel_name {
+        "cli" => "zeroclaw_cli",
+        "daemon" => "zeroclaw_agent",
+        _ => "zeroclaw_channel",
+    }
+    .to_string()
+}
+
+fn build_usage_attribution(
+    turn_id: &str,
+    iteration: usize,
+    channel_name: &str,
+) -> LlmUsageAttribution {
+    let context = USAGE_ATTRIBUTION_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
+    LlmUsageAttribution {
+        turn_id: turn_id.to_string(),
+        iteration: u32::try_from(iteration + 1).unwrap_or(u32::MAX),
+        channel: context
+            .as_ref()
+            .map(|ctx| ctx.channel.clone())
+            .unwrap_or_else(|| channel_name.to_string()),
+        source: context
+            .as_ref()
+            .map(|ctx| ctx.source.clone())
+            .unwrap_or_else(|| default_usage_source(channel_name)),
+        cron_job_id: context.as_ref().and_then(|ctx| ctx.cron_job_id.clone()),
+        cron_job_name: context.as_ref().and_then(|ctx| ctx.cron_job_name.clone()),
+    }
+}
+
 // ── Agent Tool-Call Loop ──────────────────────────────────────────────────
 // Core agentic iteration: send conversation to the LLM, parse any tool
 // calls from the response, execute them, append results to history, and
@@ -954,6 +1000,11 @@ pub(crate) async fn run_tool_call_loop(
                     error_message: None,
                     input_tokens: resp_input_tokens,
                     output_tokens: resp_output_tokens,
+                    usage_attribution: Some(build_usage_attribution(
+                        &turn_id,
+                        iteration,
+                        channel_name,
+                    )),
                 });
 
                 let response_text = resp.text_or_empty().to_string();
@@ -1053,6 +1104,11 @@ pub(crate) async fn run_tool_call_loop(
                     error_message: Some(safe_error.clone()),
                     input_tokens: None,
                     output_tokens: None,
+                    usage_attribution: Some(build_usage_attribution(
+                        &turn_id,
+                        iteration,
+                        channel_name,
+                    )),
                 });
                 runtime_trace::record_event(
                     "llm_response",
@@ -2327,6 +2383,33 @@ pub async fn run(
     });
 
     Ok(final_output)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_usage_attribution(
+    config: Config,
+    message: Option<String>,
+    provider_override: Option<String>,
+    model_override: Option<String>,
+    temperature: f64,
+    peripheral_overrides: Vec<String>,
+    interactive: bool,
+    usage_context: UsageAttributionContext,
+) -> Result<String> {
+    USAGE_ATTRIBUTION_CONTEXT
+        .scope(
+            Some(usage_context),
+            run(
+                config,
+                message,
+                provider_override,
+                model_override,
+                temperature,
+                peripheral_overrides,
+                interactive,
+            ),
+        )
+        .await
 }
 
 /// Process a single message through the full agent (with tools, peripherals, memory).

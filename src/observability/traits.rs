@@ -1,5 +1,16 @@
 use std::time::Duration;
 
+/// Durable usage attribution attached to provider-token reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmUsageAttribution {
+    pub turn_id: String,
+    pub iteration: u32,
+    pub channel: String,
+    pub source: String,
+    pub cron_job_id: Option<String>,
+    pub cron_job_name: Option<String>,
+}
+
 /// Discrete events emitted by the agent runtime for observability.
 ///
 /// Each variant represents a lifecycle event that observers can record,
@@ -28,6 +39,7 @@ pub enum ObserverEvent {
         error_message: Option<String>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        usage_attribution: Option<LlmUsageAttribution>,
     },
     /// The agent session has finished.
     ///

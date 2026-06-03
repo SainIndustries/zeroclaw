@@ -1,3 +1,4 @@
+pub mod aura_usage;
 pub mod cost;
 pub mod log;
 pub mod multi;
@@ -13,12 +14,13 @@ pub mod verbose;
 pub use self::log::LogObserver;
 #[allow(unused_imports)]
 pub use self::multi::MultiObserver;
+pub use aura_usage::AuraUsageObserver;
 pub use cost::CostObserver;
 pub use noop::NoopObserver;
 #[cfg(feature = "observability-otel")]
 pub use otel::OtelObserver;
 pub use prometheus::PrometheusObserver;
-pub use traits::{Observer, ObserverEvent};
+pub use traits::{LlmUsageAttribution, Observer, ObserverEvent};
 #[allow(unused_imports)]
 pub use verbose::VerboseObserver;
 
@@ -29,7 +31,7 @@ use std::sync::Arc;
 
 /// Factory: create the right observer from config
 pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
-    create_observer_internal(config)
+    create_observer_with_aura_usage(create_observer_internal(config))
 }
 
 /// Create an observer stack with optional cost tracking.
@@ -43,15 +45,27 @@ pub fn create_observer_with_cost_tracking(
 ) -> Box<dyn Observer> {
     let base_observer = create_observer_internal(config);
 
-    match cost_tracker {
+    let observer = match cost_tracker {
         Some(tracker) if cost_config.enabled => {
             let cost_observer = CostObserver::new(tracker, cost_config.prices.clone());
             Box::new(MultiObserver::new(vec![
                 base_observer,
                 Box::new(cost_observer),
-            ]))
+            ])) as Box<dyn Observer>
         }
         _ => base_observer,
+    };
+    create_observer_with_aura_usage(observer)
+}
+
+fn create_observer_with_aura_usage(base_observer: Box<dyn Observer>) -> Box<dyn Observer> {
+    if let Some(aura_usage) = AuraUsageObserver::from_env() {
+        Box::new(MultiObserver::new(vec![
+            base_observer,
+            Box::new(aura_usage),
+        ]))
+    } else {
+        base_observer
     }
 }
 

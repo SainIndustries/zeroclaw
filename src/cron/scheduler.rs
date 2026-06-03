@@ -8,8 +8,9 @@ use crate::channels::{
 };
 use crate::config::Config;
 use crate::cron::{
-    due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
-    update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
+    claim_due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job,
+    reschedule_after_run, update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule,
+    SessionTarget,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -44,11 +45,11 @@ pub async fn run(config: Config) -> Result<()> {
         // Keep scheduler liveness fresh even when there are no due jobs.
         crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
-        let jobs = match due_jobs(&config, Utc::now()) {
+        let jobs = match claim_due_jobs(&config, Utc::now()) {
             Ok(jobs) => jobs,
             Err(e) => {
                 crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
-                tracing::warn!("Scheduler query failed: {e}");
+                tracing::warn!("Scheduler claim failed: {e}");
                 continue;
             }
         };
@@ -176,7 +177,7 @@ async fn run_agent_job(
 
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            crate::agent::run(
+            crate::agent::run_with_usage_attribution(
                 config.clone(),
                 Some(prefixed_prompt),
                 None,
@@ -184,6 +185,12 @@ async fn run_agent_job(
                 config.default_temperature,
                 vec![],
                 false,
+                crate::agent::UsageAttributionContext {
+                    channel: "proactive".to_string(),
+                    source: "zeroclaw_cron".to_string(),
+                    cron_job_id: Some(job.id.clone()),
+                    cron_job_name: job.name.clone(),
+                },
             )
             .await
         }
