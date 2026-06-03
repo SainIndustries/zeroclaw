@@ -23,6 +23,7 @@ const ENDPOINT_PREFIX: &str = "bedrock-runtime";
 const SIGNING_SERVICE: &str = "bedrock";
 const DEFAULT_REGION: &str = "us-east-1";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
+const ECS_CREDENTIALS_ENDPOINT: &str = "http://169.254.170.2";
 
 // ── AWS Credentials ─────────────────────────────────────────────
 
@@ -32,6 +33,16 @@ struct AwsCredentials {
     secret_access_key: String,
     session_token: Option<String>,
     region: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetadataCredentials {
+    #[serde(rename = "AccessKeyId")]
+    access_key_id: String,
+    #[serde(rename = "SecretAccessKey")]
+    secret_access_key: String,
+    #[serde(rename = "Token")]
+    session_token: Option<String>,
 }
 
 impl AwsCredentials {
@@ -52,6 +63,62 @@ impl AwsCredentials {
             session_token,
             region,
         })
+    }
+
+    fn from_metadata_credentials(creds: MetadataCredentials, source: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !creds.access_key_id.trim().is_empty(),
+            "Missing AccessKeyId in {source} response"
+        );
+        anyhow::ensure!(
+            !creds.secret_access_key.trim().is_empty(),
+            "Missing SecretAccessKey in {source} response"
+        );
+
+        let region = env_optional("AWS_REGION")
+            .or_else(|| env_optional("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|| DEFAULT_REGION.to_string());
+
+        Ok(Self {
+            access_key_id: creds.access_key_id,
+            secret_access_key: creds.secret_access_key,
+            session_token: creds.session_token,
+            region,
+        })
+    }
+
+    fn ecs_credentials_url() -> Option<String> {
+        if let Some(uri) = env_optional("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") {
+            return Some(format!("{ECS_CREDENTIALS_ENDPOINT}{uri}"));
+        }
+
+        env_optional("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+    }
+
+    /// Fetch credentials from the ECS/Fargate container credential endpoint.
+    async fn from_ecs_container() -> anyhow::Result<Self> {
+        let url = Self::ecs_credentials_url()
+            .ok_or_else(|| anyhow::anyhow!("ECS container credentials URI not set"))?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()?;
+
+        let mut request = client.get(&url);
+        if let Some(token) = env_optional("AWS_CONTAINER_AUTHORIZATION_TOKEN") {
+            request = request.header("Authorization", token);
+        } else if let Some(token_file) = env_optional("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE") {
+            if let Ok(token) = std::fs::read_to_string(token_file) {
+                let token = token.trim();
+                if !token.is_empty() {
+                    request = request.header("Authorization", token);
+                }
+            }
+        }
+
+        let creds: MetadataCredentials = request.send().await?.error_for_status()?.json().await?;
+        let resolved = Self::from_metadata_credentials(creds, "ECS container credentials")?;
+        tracing::info!("Loaded AWS credentials from ECS container credential endpoint");
+        Ok(resolved)
     }
 
     /// Fetch credentials from EC2 IMDSv2 instance metadata service.
@@ -85,23 +152,14 @@ impl AwsCredentials {
             "http://169.254.169.254/latest/meta-data/iam/security-credentials/{}",
             role
         );
-        let creds_json: serde_json::Value = client
+        let creds: MetadataCredentials = client
             .get(&creds_url)
             .header("X-aws-ec2-metadata-token", &token)
             .send()
             .await?
+            .error_for_status()?
             .json()
             .await?;
-
-        let access_key_id = creds_json["AccessKeyId"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing AccessKeyId in IMDS response"))?
-            .to_string();
-        let secret_access_key = creds_json["SecretAccessKey"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing SecretAccessKey in IMDS response"))?
-            .to_string();
-        let session_token = creds_json["Token"].as_str().map(|s| s.to_string());
 
         // Step 4: get region from instance identity document
         let region = match client
@@ -126,24 +184,35 @@ impl AwsCredentials {
             role
         );
 
-        Ok(Self {
-            access_key_id,
-            secret_access_key,
-            session_token,
-            region,
-        })
+        let mut resolved = Self::from_metadata_credentials(creds, "IMDS")?;
+        resolved.region = region;
+        Ok(resolved)
     }
 
-    /// Resolve credentials: env vars first, then EC2 IMDS.
+    /// Resolve credentials: env vars first, then ECS/Fargate, then EC2 IMDS.
     async fn resolve() -> anyhow::Result<Self> {
         if let Ok(creds) = Self::from_env() {
             return Ok(creds);
+        }
+        if Self::ecs_credentials_url().is_some() {
+            return Self::from_ecs_container().await;
         }
         Self::from_imds().await
     }
 
     fn host(&self) -> String {
         format!("{ENDPOINT_PREFIX}.{}.amazonaws.com", self.region)
+    }
+
+    #[cfg(test)]
+    fn from_metadata_json_for_test(json: &str, source: &str) -> anyhow::Result<Self> {
+        let creds: MetadataCredentials = serde_json::from_str(json)?;
+        Self::from_metadata_credentials(creds, source)
+    }
+
+    #[cfg(test)]
+    fn ecs_credentials_url_from_relative_for_test(relative_uri: &str) -> String {
+        format!("{ECS_CREDENTIALS_ENDPOINT}{relative_uri}")
     }
 }
 
@@ -1684,6 +1753,32 @@ mod tests {
             region: "us-west-2".to_string(),
         };
         assert_eq!(creds.host(), "bedrock-runtime.us-west-2.amazonaws.com");
+    }
+
+    #[test]
+    fn metadata_credentials_parse_ecs_response_shape() {
+        let creds = AwsCredentials::from_metadata_json_for_test(
+            r#"{
+                "AccessKeyId": "AKIA_TEST",
+                "SecretAccessKey": "secret",
+                "Token": "session-token",
+                "Expiration": "2026-06-03T07:00:00Z"
+            }"#,
+            "ECS container credentials",
+        )
+        .expect("metadata credentials should parse");
+
+        assert_eq!(creds.access_key_id, "AKIA_TEST");
+        assert_eq!(creds.secret_access_key, "secret");
+        assert_eq!(creds.session_token.as_deref(), Some("session-token"));
+        assert_eq!(creds.region, DEFAULT_REGION);
+    }
+
+    #[test]
+    fn ecs_relative_credentials_uri_uses_container_endpoint() {
+        let url =
+            AwsCredentials::ecs_credentials_url_from_relative_for_test("/v2/credentials/task-role");
+        assert_eq!(url, "http://169.254.170.2/v2/credentials/task-role");
     }
 
     // ── Provider construction tests ─────────────────────────────
