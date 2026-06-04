@@ -1,3 +1,4 @@
+pub mod aura_usage;
 pub mod dora;
 pub mod log;
 pub mod multi;
@@ -14,12 +15,14 @@ pub mod verbose;
 pub use self::log::LogObserver;
 #[allow(unused_imports)]
 pub use self::multi::MultiObserver;
+#[allow(unused_imports)]
+pub use aura_usage::AuraUsageObserver;
 pub use noop::NoopObserver;
 #[cfg(feature = "observability-otel")]
 pub use otel::OtelObserver;
 #[cfg(feature = "observability-prometheus")]
 pub use prometheus::PrometheusObserver;
-pub use traits::{Observer, ObserverEvent};
+pub use traits::{LlmUsageAttribution, Observer, ObserverEvent};
 #[allow(unused_imports)]
 pub use verbose::VerboseObserver;
 
@@ -152,7 +155,7 @@ impl Observer for TeeObserver {
 /// Factory: create the right observer from config
 pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     Box::new(TeeObserver {
-        primary: create_primary_observer(config),
+        primary: create_observer_with_aura_usage(create_primary_observer(config)),
     })
 }
 
@@ -230,6 +233,14 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
             );
             Box::new(NoopObserver)
         }
+    }
+}
+
+fn create_observer_with_aura_usage(base: Box<dyn Observer>) -> Box<dyn Observer> {
+    if let Some(aura_usage) = AuraUsageObserver::from_env() {
+        Box::new(MultiObserver::new(vec![base, Box::new(aura_usage)]))
+    } else {
+        base
     }
 }
 

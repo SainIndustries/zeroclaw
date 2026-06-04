@@ -1,7 +1,7 @@
 use crate::cron::store::{RunCompletionAction, persist_run_completion_state, persist_run_result};
 use crate::cron::{
-    CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, due_jobs,
-    next_run_for_schedule, sync_declarative_jobs,
+    CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, claim_all_overdue_jobs,
+    claim_due_jobs, next_run_for_schedule, sync_declarative_jobs,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -194,7 +194,7 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
         // Keep scheduler liveness fresh even when there are no due jobs.
         crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
-        let jobs = match due_jobs(&config, Utc::now()) {
+        let jobs = match claim_due_jobs(&config, Utc::now()) {
             Ok(jobs) => jobs,
             Err(e) => {
                 crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
@@ -203,7 +203,7 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "Scheduler query failed"
+                    "Scheduler claim failed"
                 );
                 continue;
             }
@@ -241,7 +241,7 @@ fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Option<&'a str
 /// (e.g. late boot, daemon restart) are caught up immediately.
 async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
     let now = Utc::now();
-    let jobs = match all_overdue_jobs(config, now) {
+    let jobs = match claim_all_overdue_jobs(config, now) {
         Ok(jobs) => jobs,
         Err(e) => {
             ::zeroclaw_log::record!(
@@ -249,7 +249,7 @@ async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "Startup catch-up query failed"
+                "Startup catch-up claim failed"
             );
             return;
         }
@@ -554,7 +554,7 @@ async fn run_agent_job(
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
             Box::pin(
-                crate::agent::run(
+                crate::agent::run_with_usage_attribution(
                     cron_config,
                     agent_alias,
                     Some(prefixed_prompt),
@@ -568,6 +568,12 @@ async fn run_agent_job(
                     Some(session_path.clone()),
                     job.allowed_tools.clone(),
                     run_overrides,
+                    crate::agent::UsageAttributionContext {
+                        channel: "proactive".to_string(),
+                        source: "zeroclaw_cron".to_string(),
+                        cron_job_id: Some(job.id.clone()),
+                        cron_job_name: job.name.clone(),
+                    },
                 )
                 .instrument(subagent_span),
             )

@@ -105,7 +105,8 @@ pub(crate) fn seed_channel_handles(
     count
 }
 use crate::cost::types::BudgetCheck;
-use crate::observability::{self, Observer, ObserverEvent};
+use crate::i18n::ToolDescriptions;
+use crate::observability::{self, LlmUsageAttribution, Observer, ObserverEvent, runtime_trace};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
 use crate::tools::{self, Tool};
@@ -159,6 +160,18 @@ pub use super::history::{
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
+#[derive(Debug, Clone)]
+pub struct UsageAttributionContext {
+    pub channel: String,
+    pub source: String,
+    pub cron_job_id: Option<String>,
+    pub cron_job_name: Option<String>,
+}
+
+tokio::task_local! {
+    static USAGE_ATTRIBUTION_CONTEXT: Option<UsageAttributionContext>;
+}
+
 /// Callback type for checking if model has been switched during tool execution.
 /// Returns Some((model_provider, model)) if a switch was requested, None otherwise.
 pub type ModelSwitchCallback = Arc<Mutex<Option<(String, String)>>>;
@@ -180,6 +193,34 @@ pub fn clear_model_switch_request() {
         let mut guard = guard;
         *guard = None;
     }
+}
+
+fn llm_usage_attribution(
+    turn_id: &str,
+    iteration: usize,
+    channel_name: &str,
+) -> LlmUsageAttribution {
+    USAGE_ATTRIBUTION_CONTEXT
+        .try_with(|context| {
+            context.as_ref().map(|context| LlmUsageAttribution {
+                turn_id: turn_id.to_string(),
+                iteration: u32::try_from(iteration + 1).unwrap_or(u32::MAX),
+                channel: context.channel.clone(),
+                source: context.source.clone(),
+                cron_job_id: context.cron_job_id.clone(),
+                cron_job_name: context.cron_job_name.clone(),
+            })
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| LlmUsageAttribution {
+            turn_id: turn_id.to_string(),
+            iteration: u32::try_from(iteration + 1).unwrap_or(u32::MAX),
+            channel: channel_name.to_string(),
+            source: "zeroclaw_channel".to_string(),
+            cron_job_id: None,
+            cron_job_name: None,
+        })
 }
 
 fn glob_match(pattern: &str, name: &str) -> bool {
@@ -1880,6 +1921,11 @@ pub async fn run_tool_call_loop(
                     error_message: None,
                     input_tokens: resp_input_tokens,
                     output_tokens: resp_output_tokens,
+                    usage_attribution: Some(llm_usage_attribution(
+                        &turn_id,
+                        iteration,
+                        channel_name,
+                    )),
                 });
 
                 // Record cost via task-local tracker (no-op when not scoped)
@@ -2036,6 +2082,7 @@ pub async fn run_tool_call_loop(
                     error_message: Some(safe_error.clone()),
                     input_tokens: None,
                     output_tokens: None,
+                    usage_attribution: None,
                 });
                 ::zeroclaw_log::record!(
                     WARN,
@@ -3096,6 +3143,42 @@ fn api_key_and_uri_for_provider(
         fallback.and_then(|e| e.api_key.clone()),
         fallback.and_then(|e| e.uri.clone()),
     )
+}
+
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_usage_attribution(
+    config: Config,
+    agent_alias: &str,
+    message: Option<String>,
+    provider_override: Option<String>,
+    model_override: Option<String>,
+    temperature: Option<f64>,
+    peripheral_overrides: Vec<String>,
+    interactive: bool,
+    session_state_file: Option<PathBuf>,
+    allowed_tools: Option<Vec<String>>,
+    overrides: AgentRunOverrides,
+    usage_context: UsageAttributionContext,
+) -> Result<String> {
+    USAGE_ATTRIBUTION_CONTEXT
+        .scope(
+            Some(usage_context),
+            run(
+                config,
+                agent_alias,
+                message,
+                provider_override,
+                model_override,
+                temperature,
+                peripheral_overrides,
+                interactive,
+                session_state_file,
+                allowed_tools,
+                overrides,
+            ),
+        )
+        .await
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]

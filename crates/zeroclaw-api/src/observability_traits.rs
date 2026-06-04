@@ -1,5 +1,19 @@
 use std::time::Duration;
 
+/// Stable usage attribution for one LLM provider call.
+///
+/// This is intentionally small and deterministic so downstream systems can
+/// dedupe reports across retries without tying billing to volatile prompt text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmUsageAttribution {
+    pub turn_id: String,
+    pub iteration: u32,
+    pub channel: String,
+    pub source: String,
+    pub cron_job_id: Option<String>,
+    pub cron_job_name: Option<String>,
+}
+
 /// Discrete events emitted by the agent runtime for observability.
 ///
 /// Each variant represents a lifecycle event that observers can record,
@@ -31,6 +45,7 @@ pub enum ObserverEvent {
         error_message: Option<String>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        usage_attribution: Option<LlmUsageAttribution>,
     },
     /// The agent session has finished.
     ///
