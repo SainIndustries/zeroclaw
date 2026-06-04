@@ -1,7 +1,7 @@
 use crate::cron::{
-    CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs,
-    due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
-    sync_declarative_jobs, update_job,
+    CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
+    claim_all_overdue_jobs, claim_due_jobs, next_run_for_schedule, record_last_run, record_run,
+    remove_job, reschedule_after_run, sync_declarative_jobs, update_job,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -88,11 +88,11 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
         // Keep scheduler liveness fresh even when there are no due jobs.
         crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
-        let jobs = match due_jobs(&config, Utc::now()) {
+        let jobs = match claim_due_jobs(&config, Utc::now()) {
             Ok(jobs) => jobs,
             Err(e) => {
                 crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
-                tracing::warn!("Scheduler query failed: {e}");
+                tracing::warn!("Scheduler claim failed: {e}");
                 continue;
             }
         };
@@ -111,10 +111,10 @@ async fn catch_up_overdue_jobs(
     event_tx: &EventBroadcast,
 ) {
     let now = Utc::now();
-    let jobs = match all_overdue_jobs(config, now) {
+    let jobs = match claim_all_overdue_jobs(config, now) {
         Ok(jobs) => jobs,
         Err(e) => {
-            tracing::warn!("Startup catch-up query failed: {e}");
+            tracing::warn!("Startup catch-up claim failed: {e}");
             return;
         }
     };
@@ -314,7 +314,7 @@ async fn run_agent_job(
 
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            Box::pin(crate::agent::run(
+            Box::pin(crate::agent::run_with_usage_attribution(
                 cron_config,
                 Some(prefixed_prompt),
                 None,
@@ -328,6 +328,12 @@ async fn run_agent_job(
                 false,
                 None,
                 job.allowed_tools.clone(),
+                crate::agent::UsageAttributionContext {
+                    channel: "proactive".to_string(),
+                    source: "zeroclaw_cron".to_string(),
+                    cron_job_id: Some(job.id.clone()),
+                    cron_job_name: job.name.clone(),
+                },
             ))
             .await
         }
