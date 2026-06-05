@@ -9,12 +9,14 @@ use crate::channels::{
 use crate::config::Config;
 use crate::cron::{
     due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
-    update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
+    reserve_delivery, update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule,
+    SessionTarget,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{stream, StreamExt};
+use sha2::{Digest, Sha256};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -316,7 +318,59 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
 
+    let delivery_key = cron_delivery_key_for_job(job, channel, target);
+    let reserved = reserve_delivery(
+        config,
+        &delivery_key,
+        &job.id,
+        channel,
+        target,
+        output,
+        Utc::now(),
+    )?;
+    if !reserved {
+        tracing::warn!(
+            job_id = %job.id,
+            channel = %channel,
+            target = %target,
+            delivery_key = %delivery_key,
+            "Cron delivery skipped: duplicate delivery reservation"
+        );
+        return Ok(());
+    }
+
     deliver_announcement(config, channel, target, output).await
+}
+
+fn cron_delivery_key_for_job(job: &CronJob, channel: &str, target: &str) -> String {
+    let occurrence = job.next_run.to_rfc3339();
+    cron_delivery_key(&job.id, &format!("scheduled:{occurrence}"), channel, target)
+}
+
+pub(crate) fn cron_manual_delivery_key(
+    job: &CronJob,
+    channel: &str,
+    target: &str,
+    output: &str,
+) -> String {
+    let output_hash = sha256_hex(output);
+    cron_delivery_key(
+        &job.id,
+        &format!("manual-output:{output_hash}"),
+        channel,
+        target,
+    )
+}
+
+fn cron_delivery_key(job_id: &str, occurrence: &str, channel: &str, target: &str) -> String {
+    let material = format!("{job_id}|{occurrence}|{channel}|{target}");
+    format!("cron-delivery:{}", sha256_hex(&material))
+}
+
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 pub(crate) async fn deliver_announcement(
@@ -715,6 +769,39 @@ mod tests {
 
     fn unique_component(prefix: &str) -> String {
         format!("{prefix}-{}", uuid::Uuid::new_v4())
+    }
+
+    #[test]
+    fn scheduled_delivery_key_is_stable_for_same_occurrence() {
+        let job = test_job("echo test");
+
+        let first = cron_delivery_key_for_job(&job, "telegram", "chat-1");
+        let second = cron_delivery_key_for_job(&job, "telegram", "chat-1");
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn scheduled_delivery_key_changes_for_next_occurrence() {
+        let mut job = test_job("echo test");
+        let first = cron_delivery_key_for_job(&job, "telegram", "chat-1");
+
+        job.next_run += ChronoDuration::days(1);
+        let second = cron_delivery_key_for_job(&job, "telegram", "chat-1");
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn manual_delivery_key_is_stable_for_same_output() {
+        let job = test_job("echo test");
+
+        let first = cron_manual_delivery_key(&job, "telegram", "chat-1", "same output");
+        let second = cron_manual_delivery_key(&job, "telegram", "chat-1", "same output");
+        let changed = cron_manual_delivery_key(&job, "telegram", "chat-1", "changed output");
+
+        assert_eq!(first, second);
+        assert_ne!(first, changed);
     }
 
     #[tokio::test]

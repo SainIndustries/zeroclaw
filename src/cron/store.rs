@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
 use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
@@ -373,6 +374,62 @@ fn truncate_cron_output(output: &str) -> String {
     truncated
 }
 
+pub fn reserve_delivery(
+    config: &Config,
+    delivery_key: &str,
+    job_id: &str,
+    channel: &str,
+    target: &str,
+    output: &str,
+    created_at: DateTime<Utc>,
+) -> Result<bool> {
+    let output_hash = hash_cron_output(output);
+    with_connection(config, |conn| {
+        let tx = conn.unchecked_transaction()?;
+        let inserted = tx
+            .execute(
+                "INSERT OR IGNORE INTO cron_deliveries (
+                    delivery_key, job_id, channel, target, output_hash, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    delivery_key,
+                    job_id,
+                    channel,
+                    target,
+                    output_hash,
+                    created_at.to_rfc3339(),
+                ],
+            )
+            .context("Failed to reserve cron delivery")?;
+
+        if inserted > 0 {
+            let keep = i64::from((config.cron.max_run_history.max(1) * 4).max(50));
+            tx.execute(
+                "DELETE FROM cron_deliveries
+                 WHERE job_id = ?1
+                   AND id NOT IN (
+                     SELECT id FROM cron_deliveries
+                     WHERE job_id = ?1
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT ?2
+                   )",
+                params![job_id, keep],
+            )
+            .context("Failed to prune cron delivery history")?;
+        }
+
+        tx.commit()
+            .context("Failed to commit cron delivery reservation")?;
+        Ok(inserted > 0)
+    })
+}
+
+fn hash_cron_output(output: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(output.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<CronRun>> {
     with_connection(config, |conn| {
         let lim = i64::try_from(limit.max(1)).context("Run history limit overflow")?;
@@ -558,7 +615,20 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
         );
         CREATE INDEX IF NOT EXISTS idx_cron_runs_job_id ON cron_runs(job_id);
         CREATE INDEX IF NOT EXISTS idx_cron_runs_started_at ON cron_runs(started_at);
-        CREATE INDEX IF NOT EXISTS idx_cron_runs_job_started ON cron_runs(job_id, started_at);",
+        CREATE INDEX IF NOT EXISTS idx_cron_runs_job_started ON cron_runs(job_id, started_at);
+
+        CREATE TABLE IF NOT EXISTS cron_deliveries (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            delivery_key TEXT NOT NULL UNIQUE,
+            job_id       TEXT NOT NULL,
+            channel      TEXT NOT NULL,
+            target       TEXT NOT NULL,
+            output_hash  TEXT,
+            created_at   TEXT NOT NULL,
+            FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_cron_deliveries_job_id ON cron_deliveries(job_id);
+        CREATE INDEX IF NOT EXISTS idx_cron_deliveries_created_at ON cron_deliveries(created_at);",
     )
     .context("Failed to initialize cron schema")?;
 
@@ -800,6 +870,49 @@ mod tests {
 
         let runs = list_runs(&config, &job.id, 10).unwrap();
         assert_eq!(runs.len(), 2);
+    }
+
+    #[test]
+    fn reserve_delivery_rejects_duplicate_key() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+
+        let first = reserve_delivery(
+            &config,
+            "delivery-key",
+            &job.id,
+            "telegram",
+            "chat-1",
+            "hello",
+            now,
+        )
+        .unwrap();
+        let duplicate = reserve_delivery(
+            &config,
+            "delivery-key",
+            &job.id,
+            "telegram",
+            "chat-1",
+            "hello again",
+            now,
+        )
+        .unwrap();
+        let different = reserve_delivery(
+            &config,
+            "delivery-key-2",
+            &job.id,
+            "telegram",
+            "chat-1",
+            "hello",
+            now,
+        )
+        .unwrap();
+
+        assert!(first);
+        assert!(!duplicate);
+        assert!(different);
     }
 
     #[test]
