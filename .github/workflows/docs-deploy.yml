@@ -1,301 +1,224 @@
-name: Docs Deploy
+name: Deploy mdBook docs to Pages
 
-on:
-    pull_request:
-        branches: [dev, main]
-        paths:
-            - "docs/**"
-            - "README*.md"
-            - ".github/workflows/docs-deploy.yml"
-            - "scripts/ci/docs_quality_gate.sh"
-            - "scripts/ci/collect_changed_links.py"
-            - ".github/release/docs-deploy-policy.json"
-            - "scripts/ci/docs_deploy_guard.py"
-    push:
-        branches: [dev, main]
-        paths:
-            - "docs/**"
-            - "README*.md"
-            - ".github/workflows/docs-deploy.yml"
-            - "scripts/ci/docs_quality_gate.sh"
-            - "scripts/ci/collect_changed_links.py"
-            - ".github/release/docs-deploy-policy.json"
-            - "scripts/ci/docs_deploy_guard.py"
-    workflow_dispatch:
-        inputs:
-            deploy_target:
-                description: "preview uploads artifact only; production deploys to Pages"
-                required: true
-                default: preview
-                type: choice
-                options:
-                    - preview
-                    - production
-            preview_evidence_run_url:
-                description: "Required for manual production deploys when policy enforces preview promotion evidence"
-                required: false
-                default: ""
-            rollback_ref:
-                description: "Optional rollback source ref (tag/sha/ref) for manual production dispatch"
-                required: false
-                default: ""
-
-concurrency:
-    group: docs-deploy-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name || github.sha }}
-    cancel-in-progress: true
-
-permissions:
-    contents: read
+# Builds the full multi-locale mdBook + rustdoc API reference and publishes
+# to a `gh-pages` branch. Configure Pages in repo Settings → Pages to serve
+# from the `gh-pages` branch root.
+#
+# All locales in locales.toml are built. Translations are produced locally
+# (see docs/book/src/maintainers/docs-and-translations.md) and committed to
+# the repo — this workflow does not call any translation provider.
 
 env:
-    GIT_CONFIG_COUNT: "1"
-    GIT_CONFIG_KEY_0: core.hooksPath
-    GIT_CONFIG_VALUE_0: /dev/null
+  DOCS_MIN_VERSION: v0.7.5
 
+on:
+  push:
+    branches: [master]
+    paths:
+      - "docs/book/**"
+      - "src/**"
+      - "crates/**"
+      - "xtask/**"
+      - "locales.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/docs-deploy.yml"
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The version tag to deploy (e.g. v0.7.5, master). If omitted, builds 'master'."
+        required: false
+        default: "master"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gh-pages
+  cancel-in-progress: false
 
 jobs:
-    docs-quality:
-        name: Docs Quality Gate
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
-        timeout-minutes: 20
-        outputs:
-            docs_files: ${{ steps.scope.outputs.docs_files }}
-            base_sha: ${{ steps.scope.outputs.base_sha }}
-            deploy_target: ${{ steps.deploy_guard.outputs.deploy_target }}
-            deploy_mode: ${{ steps.deploy_guard.outputs.deploy_mode }}
-            source_ref: ${{ steps.deploy_guard.outputs.source_ref }}
-            production_branch_ref: ${{ steps.deploy_guard.outputs.production_branch_ref }}
-            ready_to_deploy: ${{ steps.deploy_guard.outputs.ready_to_deploy }}
-            docs_preview_retention_days: ${{ steps.deploy_guard.outputs.docs_preview_retention_days }}
-            docs_guard_artifact_retention_days: ${{ steps.deploy_guard.outputs.docs_guard_artifact_retention_days }}
-        steps:
-            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-              with:
-                  fetch-depth: 0
+  deploy:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Determine version tag
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+            # Validate: must be 'master' or a semver tag like v0.7.5 / v0.8.0-beta-1.
+            if ! [[ "$TAG" =~ ^(master|v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9._-]+)?)$ ]]; then
+              echo "::error::Invalid tag input '${TAG}'. Must be 'master' or match v<major>.<minor>.<patch>[-<pre>]."
+              exit 1
+            fi
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="master"
+          fi
 
-            - name: Setup Node.js
-              uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-              with:
-                  node-version: "22"
+          # Enforce version floor (skip for master)
+          if [[ "$TAG" =~ ^v ]]; then
+            OLDEST=$(printf '%s\n' "$TAG" "$DOCS_MIN_VERSION" | sort -V | head -n1)
+            if [ "$OLDEST" = "$TAG" ] && [ "$TAG" != "$DOCS_MIN_VERSION" ]; then
+              echo "::error::Tag '${TAG}' is below minimum deployable version '${DOCS_MIN_VERSION}'."
+              exit 1
+            fi
+          fi
 
-            - name: Resolve docs diff scope
-              id: scope
-              shell: bash
-              run: |
-                  set -euo pipefail
+          echo "TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "Building docs for TAG=$TAG"
 
-                  base_sha=""
-                  docs_files=""
+      # Checks out the version being built. For workflow_dispatch with an old
+      # release tag, this replaces the workspace with that tag's source tree,
+      # which may predate the deploy helpers introduced in this PR.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 1
 
-                  if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
-                    base_sha="${{ github.event.pull_request.base.sha }}"
-                    docs_files="$(git diff --name-only "$base_sha" HEAD | awk '/\.md$|\.mdx$|^README/ {print}')"
-                  elif [ "${GITHUB_EVENT_NAME}" = "push" ]; then
-                    base_sha="${{ github.event.before }}"
-                    if [ -n "$base_sha" ] && [ "$base_sha" != "0000000000000000000000000000000000000000" ]; then
-                      docs_files="$(git diff --name-only "$base_sha" HEAD | awk '/\.md$|\.mdx$|^README/ {print}')"
-                    fi
-                  else
-                    docs_files="$(git ls-files 'docs/**/*.md' 'README*.md')"
-                  fi
+      # Always fetch the deploy-helper scripts from the commit that triggered
+      # this workflow run (github.sha). For workflow_dispatch, github.sha is
+      # master's HEAD — regardless of which tag input was chosen — so the
+      # helpers are always present even when the target ref predates this PR.
+      # For tag-push events, github.sha is the tag commit, which will contain
+      # the helpers because pre-PR tags don't carry this workflow file and
+      # cannot trigger a tag-push run.
+      - name: Fetch deploy helpers from current workflow revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          path: .workflow-scripts
+          fetch-depth: 1
 
-                  {
-                    echo "base_sha=${base_sha}"
-                    echo "docs_files<<EOF"
-                    printf '%s\n' "$docs_files"
-                    echo "EOF"
-                  } >> "$GITHUB_OUTPUT"
 
-            - name: Validate docs deploy contract
-              id: deploy_guard
-              shell: bash
-              env:
-                  INPUT_DEPLOY_TARGET: ${{ github.event.inputs.deploy_target || '' }}
-                  INPUT_PREVIEW_EVIDENCE_RUN_URL: ${{ github.event.inputs.preview_evidence_run_url || '' }}
-                  INPUT_ROLLBACK_REF: ${{ github.event.inputs.rollback_ref || '' }}
-              run: |
-                  set -euo pipefail
-                  mkdir -p artifacts
-                  python3 scripts/ci/docs_deploy_guard.py \
-                    --repo-root "$PWD" \
-                    --event-name "${GITHUB_EVENT_NAME}" \
-                    --git-ref "${GITHUB_REF}" \
-                    --git-sha "${GITHUB_SHA}" \
-                    --input-deploy-target "${INPUT_DEPLOY_TARGET}" \
-                    --input-preview-evidence-run-url "${INPUT_PREVIEW_EVIDENCE_RUN_URL}" \
-                    --input-rollback-ref "${INPUT_ROLLBACK_REF}" \
-                    --policy-file .github/release/docs-deploy-policy.json \
-                    --output-json artifacts/docs-deploy-guard.json \
-                    --output-md artifacts/docs-deploy-guard.md \
-                    --github-output-file "$GITHUB_OUTPUT" \
-                    --fail-on-violation
+      # MDBOOK_BIN_VERSION is scoped to this step only. Workflow-level
+      # `MDBOOK_*` env vars leak into `cargo mdbook build` below — mdbook 0.5.0
+      # rejects unknown `MDBOOK_*` env vars as invalid config keys (#2942).
+      - name: Install mdBook (aarch64 musl, ~3 MB)
+        env:
+          # Pinned to match the mdbook-mermaid 0.17.0 compile target — avoids
+          # "preprocessor was built against 0.5.0, called from 0.5.2" warning.
+          # Revisit when mdbook-mermaid ships against the latest mdbook minor.
+          MDBOOK_BIN_VERSION: v0.5.0
+        run: |
+          curl -sSL "https://github.com/rust-lang/mdBook/releases/download/${MDBOOK_BIN_VERSION}/mdbook-${MDBOOK_BIN_VERSION}-aarch64-unknown-linux-musl.tar.gz" \
+            | tar -xz -C /usr/local/bin
 
-            - name: Emit docs deploy guard audit event
-              if: always()
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  if [ -f artifacts/docs-deploy-guard.json ]; then
-                    python3 scripts/ci/emit_audit_event.py \
-                      --event-type docs_deploy_guard \
-                      --input-json artifacts/docs-deploy-guard.json \
-                      --output-json artifacts/audit-event-docs-deploy-guard.json \
-                      --artifact-name docs-deploy-guard \
-                      --retention-days 21
-                  fi
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
 
-            - name: Publish docs deploy guard summary
-              if: always()
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  if [ -f artifacts/docs-deploy-guard.md ]; then
-                    cat artifacts/docs-deploy-guard.md >> "$GITHUB_STEP_SUMMARY"
-                  fi
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: docs-deploy
+          cache-all-crates: true
 
-            - name: Upload docs deploy guard artifacts
-              if: always()
-              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-              with:
-                  name: docs-deploy-guard
-                  path: |
-                      artifacts/docs-deploy-guard.json
-                      artifacts/docs-deploy-guard.md
-                      artifacts/audit-event-docs-deploy-guard.json
-                  if-no-files-found: ignore
-                  retention-days: ${{ steps.deploy_guard.outputs.docs_guard_artifact_retention_days || 21 }}
+      - name: Update package lists
+        run: sudo apt-get update
 
-            - name: Setup Node.js for markdown lint
-              uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-              with:
-                  node-version: "22"
+      - name: Install gettext tools
+        run: sudo apt-get install -y --no-install-recommends gettext
 
-            - name: Markdown quality gate
-              env:
-                  BASE_SHA: ${{ steps.scope.outputs.base_sha }}
-                  DOCS_FILES: ${{ steps.scope.outputs.docs_files }}
-              run: ./scripts/ci/docs_quality_gate.sh
+      - name: Install rsync
+        run: sudo apt-get install -y --no-install-recommends rsync
 
-            - name: Collect added links
-              id: links
-              if: github.event_name != 'workflow_dispatch'
-              shell: bash
-              env:
-                  BASE_SHA: ${{ steps.scope.outputs.base_sha }}
-                  DOCS_FILES: ${{ steps.scope.outputs.docs_files }}
-              run: |
-                  set -euo pipefail
-                  python3 ./scripts/ci/collect_changed_links.py \
-                    --base "$BASE_SHA" \
-                    --docs-files "$DOCS_FILES" \
-                    --output .ci-added-links.txt
-                  count=$(wc -l < .ci-added-links.txt | tr -d ' ')
-                  echo "count=$count" >> "$GITHUB_OUTPUT"
+      - name: Validate .po format
+        run: |
+          ok=0
+          for po in docs/book/po/*.po; do
+            [ -f "$po" ] || continue
+            msgfmt --check-format "$po" -o /dev/null || ok=1
+          done
+          exit $ok
 
-            - name: Link check (added links)
-              if: github.event_name != 'workflow_dispatch' && steps.links.outputs.count != '0'
-              uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2
-              with:
-                  fail: true
-                  args: >-
-                      --offline
-                      --no-progress
-                      --format detailed
-                      .ci-added-links.txt
-              env:
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # `cargo mdbook build` is an xtask alias (see .cargo/config.toml) that:
+      #   - ensure_cargo_tool installs mdbook-i18n-helpers and mdbook-mermaid
+      #   - Generates docs/book/src/reference/cli.md + config.md from live code
+      #   - Builds rustdoc across the workspace
+      #   - Builds mdBook for every locale in locales.toml into book/<locale>/
+      #   - Assembles the final artifact (copies rustdoc to book/api, writes
+      #     root index.html that redirects to /en/)
+      - name: Build docs (refs + rustdoc + all locales)
+        env:
+          TAG: ${{ steps.version.outputs.TAG }}
+        run: |
+          echo "Building docs for TAG=$TAG"
+          cargo mdbook build
 
-            - name: Skip link check (none added)
-              if: github.event_name != 'workflow_dispatch' && steps.links.outputs.count == '0'
-              run: echo "No added links detected in changed docs lines."
+      - name: Update gh-pages branch (merge build output)
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.TAG }}
+        run: |
+          set -euo pipefail
+          REPO="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          CLONE_DIR=$(mktemp -d)
+          echo "Cloning gh-pages into ${CLONE_DIR}"
+          if git ls-remote --exit-code origin gh-pages > /dev/null 2>&1; then
+            git clone --depth 1 --branch gh-pages "$REPO" "$CLONE_DIR"
+          else
+            # gh-pages does not exist yet — bootstrap an orphan branch.
+            git clone --depth 1 "$REPO" "$CLONE_DIR"
+            pushd "$CLONE_DIR" > /dev/null
+            if ! git switch --orphan gh-pages 2>/dev/null; then
+              # Fallback for older Git versions (< 2.23).
+              git checkout --orphan gh-pages || { echo "::error::Failed to create orphan gh-pages branch"; exit 1; }
+            fi
+            git rm -rf . > /dev/null 2>&1 || true
+            popd > /dev/null
+          fi
 
-    docs-preview:
-        name: Docs Preview Artifact
-        needs: [docs-quality]
-        if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_target == 'preview')
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
-        timeout-minutes: 15
-        steps:
-            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+          # Copy built tag docs into gh-pages under '<tag>/'
+          mkdir -p "$CLONE_DIR/$TAG"
+          if [ -d "docs/book/book/$TAG" ]; then
+            rsync -a --delete "docs/book/book/$TAG/" "$CLONE_DIR/$TAG/"
+          else
+            echo "Old docs layout detected (unversioned). Restructuring to $TAG/..."
+            mkdir -p "docs/book/book_temp/$TAG"
+            rsync -a docs/book/book/ "docs/book/book_temp/$TAG/"
+            rsync -a --delete "docs/book/book_temp/$TAG/" "$CLONE_DIR/$TAG/"
+            rm -rf docs/book/book_temp
+          fi
 
-            - name: Build preview bundle
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  rm -rf site
-                  mkdir -p site/docs
-                  cp -R docs/. site/docs/
-                  cp README.md site/README.md
-                  cat > site/index.md <<'EOF'
-                  # ZeroClaw Docs Preview
+          # If this is a stable release (no pre-release suffix), also copy to /stable/
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            mkdir -p "$CLONE_DIR/stable"
+            rsync -a --delete "$CLONE_DIR/$TAG/" "$CLONE_DIR/stable/"
+          fi
 
-                  This preview bundle is produced by `.github/workflows/docs-deploy.yml`.
+          # Generate versions.json by scanning gh-pages root for version directories
+          pushd "$CLONE_DIR" > /dev/null
 
-                  - [Repository README](./README.md)
-                  - [Docs Home](./docs/README.md)
-                  EOF
+          # Persist custom domain — must be present on every push to gh-pages
+          # or GitHub Pages will remove it (re-introduced fix from #6142).
+          echo "docs.zeroclawlabs.ai" > CNAME
 
-            - name: Upload preview artifact
-              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-              with:
-                  name: docs-preview
-                  path: site/**
-                  if-no-files-found: error
-                  retention-days: ${{ needs.docs-quality.outputs.docs_preview_retention_days || 14 }}
+          SCRIPTS="${GITHUB_WORKSPACE}/.workflow-scripts/.github/scripts"
+          
+          # Sync shared chrome — new xtask produces book/_shared/
+          if [ -d "${GITHUB_WORKSPACE}/docs/book/book/_shared" ]; then
+            mkdir -p "$CLONE_DIR/_shared"
+            rsync -a --delete "${GITHUB_WORKSPACE}/docs/book/book/_shared/" "$CLONE_DIR/_shared/"
+          else
+            # Old-tag fallback: extract chrome from the deployed version content
+            cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- extract-chrome "$CLONE_DIR/$TAG" "$CLONE_DIR/_shared"
+          fi
 
-    docs-deploy:
-        name: Deploy Docs to GitHub Pages
-        needs: [docs-quality]
-        if: needs.docs-quality.outputs.deploy_target == 'production' && needs.docs-quality.outputs.ready_to_deploy == 'true'
-        runs-on: [self-hosted, Linux, X64, aws-india, blacksmith-2vcpu-ubuntu-2404, hetzner]
-        timeout-minutes: 20
-        permissions:
-            contents: read
-            pages: write
-            id-token: write
-        environment:
-            name: github-pages
-            url: ${{ steps.deployment.outputs.page_url }}
-        steps:
-            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-              with:
-                  ref: ${{ needs.docs-quality.outputs.source_ref }}
+          cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- gen-versions > versions.json
 
-            - name: Build deploy bundle
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  rm -rf site
-                  mkdir -p site/docs
-                  cp -R docs/. site/docs/
-                  cp README.md site/README.md
-                  cat > site/index.md <<'EOF'
-                  # ZeroClaw Documentation
+          # Ensure root index.html points to /stable/en/ if stable docs exist, otherwise /master/en/
+          if [ -d "stable" ]; then
+            bash "${SCRIPTS}/gen-index-stable.sh"
+          else
+            bash "${SCRIPTS}/gen-index-master.sh"
+          fi
 
-                  This site is deployed automatically from `main` by `.github/workflows/docs-deploy.yml`.
-
-                  - [Repository README](./README.md)
-                  - [Docs Home](./docs/README.md)
-                  EOF
-
-            - name: Publish deploy source summary
-              shell: bash
-              run: |
-                  {
-                    echo "## Docs Deploy Source"
-                    echo "- Deploy mode: \`${{ needs.docs-quality.outputs.deploy_mode }}\`"
-                    echo "- Source ref: \`${{ needs.docs-quality.outputs.source_ref }}\`"
-                    echo "- Production branch ref: \`${{ needs.docs-quality.outputs.production_branch_ref }}\`"
-                  } >> "$GITHUB_STEP_SUMMARY"
-
-            - name: Setup Pages
-              uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
-
-            - name: Upload Pages artifact
-              uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
-              with:
-                  path: site
-
-            - name: Deploy to GitHub Pages
-              id: deployment
-              uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+          git add --all
+          git -c user.name="$GIT_AUTHOR_NAME" -c user.email="$GIT_AUTHOR_EMAIL" commit -m "docs: update docs for $TAG (from $GITHUB_SHA)" || true
+          git push "$REPO" gh-pages
+          popd >/dev/null

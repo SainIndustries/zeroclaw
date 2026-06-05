@@ -2,13 +2,19 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { BrowserRouter } from 'react-router-dom';
 import App from './App';
+import { basePath } from './lib/basePath';
 import './index.css';
 
-ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode>
-    {/* Vite base '/_app/' scopes static asset URLs only; app routes stay rooted at '/' for SPA fallback. */}
-    <BrowserRouter basename="/">
-      <App />
-    </BrowserRouter>
-  </React.StrictMode>
-);
+const unsupportedBrowser =
+  document.documentElement.getAttribute('data-unsupported-browser') === '1';
+
+if (!unsupportedBrowser) {
+  ReactDOM.createRoot(document.getElementById('root')!).render(
+    <React.StrictMode>
+      {/* basePath is injected by the Rust gateway at serve time for reverse-proxy prefix support. */}
+      <BrowserRouter basename={basePath || '/'}>
+        <App />
+      </BrowserRouter>
+    </React.StrictMode>
+  );
+}

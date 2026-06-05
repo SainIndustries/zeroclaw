@@ -1,189 +1,175 @@
 <p align="center">
-  <img src="zeroclaw.png" alt="ZeroClaw" width="200" />
+  <img src="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/docs/assets/zeroclaw-banner.png" alt="ZeroClaw" width="600" />
 </p>
 
-<h1 align="center">ZeroClaw 🦀</h1>
+<h1 align="center">🦀 ZeroClaw — Personal AI Assistant</h1>
 
 <p align="center">
-  <strong>Zero overhead. Zero compromise. 100% Rust. 100% Agnostic.</strong><br>
-  ⚡️ <strong>Runs on any hardware with <5MB RAM: That's 99% less memory than OpenClaw and 98% cheaper than a Mac mini!</strong>
-</p>
-
-<p align="center">
-  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
-  <a href="NOTICE"><img src="https://img.shields.io/github/contributors/zeroclaw-labs/zeroclaw?color=green" alt="Contributors" /></a>
-  <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
-  <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
-  <a href="https://zeroclawlabs.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
-  <a href="https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search"><img src="https://img.shields.io/badge/Xiaohongshu-Official-FF2442?style=flat" alt="Xiaohongshu: Official" /></a>
-  <a href="https://t.me/zeroclawlabs"><img src="https://img.shields.io/badge/Telegram-%40zeroclawlabs-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @zeroclawlabs" /></a>
-  <a href="https://www.facebook.com/groups/zeroclaw"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
-  <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
-</p>
-<p align="center">
-Built by students and members of the Harvard, MIT, and Sundai.Club communities.
+  <strong>You own the agent. You own the data. You own the machine it runs on.</strong>
 </p>
 
 <p align="center">
-  🌐 <strong>Languages:</strong> <a href="README.md">English</a> · <a href="docs/i18n/zh-CN/README.md">简体中文</a> · <a href="docs/i18n/ja/README.md">日本語</a> · <a href="docs/i18n/ru/README.md">Русский</a> · <a href="docs/i18n/fr/README.md">Français</a> · <a href="docs/i18n/vi/README.md">Tiếng Việt</a> · <a href="docs/i18n/el/README.md">Ελληνικά</a>
+  <a href="https://github.com/zeroclaw-labs/zeroclaw/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/zeroclaw-labs/zeroclaw/ci.yml?branch=master&label=build" alt="Build Status" /></a>
+  <a href="https://github.com/zeroclaw-labs/zeroclaw/releases/latest"><img src="https://img.shields.io/github/v/release/zeroclaw-labs/zeroclaw?label=release" alt="Latest release" /></a>
+  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-edition%202024-orange?logo=rust" alt="Rust Edition 2024" /></a>
+  <a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors"><img src="https://img.shields.io/github/contributors/zeroclaw-labs/zeroclaw?color=green" alt="Contributors" /></a>
+  <a href="https://discord.com/invite/wDshRVqRjx"><img src="https://img.shields.io/badge/Discord-join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
 </p>
 
 <p align="center">
-  <a href="#quick-start">Getting Started</a> |
-  <a href="docs/one-click-bootstrap.md">One-Click Setup</a> |
-  <a href="docs/README.md">Docs Hub</a> |
-  <a href="docs/SUMMARY.md">Docs TOC</a>
+  <a href="docs/book/src/introduction.md">Docs</a> ·
+  <a href="docs/book/src/philosophy.md">Philosophy</a> ·
+  <a href="docs/book/src/getting-started/quick-start.md">Quick start</a> ·
+  <a href="docs/book/src/architecture/overview.md">Architecture</a> ·
+  <a href="https://discord.com/invite/wDshRVqRjx">Discord</a>
 </p>
 
-<p align="center">
-  <strong>Quick Routes:</strong>
-  <a href="docs/reference/README.md">Reference</a> ·
-  <a href="docs/operations/README.md">Operations</a> ·
-  <a href="docs/troubleshooting.md">Troubleshoot</a> ·
-  <a href="docs/security/README.md">Security</a> ·
-  <a href="docs/hardware/README.md">Hardware</a> ·
-  <a href="docs/contributing/README.md">Contribute</a>
-</p>
+---
 
-<p align="center">
-  <strong>Fast, small, and fully autonomous Framework</strong><br />
-  Deploy anywhere. Swap anything.
-</p>
+ZeroClaw is an agent runtime — a single Rust binary you configure and run. It talks to LLM providers (Anthropic, OpenAI, Ollama, and ~20 others), reaches the world through 30+ channels (Discord, Telegram, Matrix, email, voice, webhooks, your own CLI), and acts through tools (shell, browser, HTTP, hardware, custom MCP servers). Everything runs on your machine, with your keys, in your workspace.
 
-<p align="center">
-  ZeroClaw is the <strong>runtime framework</strong> for agentic workflows — infrastructure that abstracts models, tools, memory, and execution so agents can be built once and run anywhere.
-</p>
+Read the [Philosophy](docs/book/src/philosophy.md) for the four opinions that shape it.
 
-<p align="center"><code>Trait-driven architecture · secure-by-default runtime · provider/channel/tool swappable · pluggable everything</code></p>
-
-### 📢 Announcements
-
-Use this board for important notices (breaking changes, security advisories, maintenance windows, and release blockers).
-
-| Date (UTC) | Level       | Notice                                                                                                                                                                                                                                                                                                                                                 | Action                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| ---------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2026-02-19 | _Critical_  | We are **not affiliated** with `openagen/zeroclaw`, `zeroclaw.org` or `zeroclaw.net`. The `zeroclaw.org` and `zeroclaw.net` domains currently points to the `openagen/zeroclaw` fork, and that domain/repository are impersonating our official website/project.                                                                                       | Do not trust information, binaries, fundraising, or announcements from those sources. Use only [this repository](https://github.com/zeroclaw-labs/zeroclaw) and our verified social accounts.                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| 2026-02-21 | _Important_ | Our official website is now live: [zeroclawlabs.ai](https://zeroclawlabs.ai). Thanks for your patience while we prepared the launch. We are still seeing impersonation attempts, so do **not** join any investment or fundraising activity claiming the ZeroClaw name unless it is published through our official channels.                            | Use [this repository](https://github.com/zeroclaw-labs/zeroclaw) as the single source of truth. Follow [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Telegram (@zeroclawlabs)](https://t.me/zeroclawlabs), [Facebook (Group)](https://www.facebook.com/groups/zeroclaw), [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/), and [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) for official updates. |
-| 2026-02-19 | _Important_ | Anthropic updated the Authentication and Credential Use terms on 2026-02-19. Claude Code OAuth tokens (Free, Pro, Max) are intended exclusively for Claude Code and Claude.ai; using OAuth tokens from Claude Free/Pro/Max in any other product, tool, or service (including Agent SDK) is not permitted and may violate the Consumer Terms of Service. | Please temporarily avoid Claude Code OAuth integrations to prevent potential loss. Original clause: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).                                                                                                                                                                                                                                                                                                                                                                                    |
-
-### ✨ Features
-
-- 🏎️ **Lean Runtime by Default:** Common CLI and status workflows run in a few-megabyte memory envelope on release builds.
-- 💰 **Cost-Efficient Deployment:** Designed for low-cost boards and small cloud instances without heavyweight runtime dependencies.
-- ⚡ **Fast Cold Starts:** Single-binary Rust runtime keeps command and daemon startup near-instant for daily operations.
-- 🌍 **Portable Architecture:** One binary-first workflow across ARM, x86, and RISC-V with swappable providers/channels/tools.
-- 🔍 **Research Phase:** Proactive information gathering through tools before response generation — reduces hallucinations by fact-checking first.
-
-### Why teams pick ZeroClaw
-
-- **Lean by default:** small Rust binary, fast startup, low memory footprint.
-- **Secure by design:** pairing, strict sandboxing, explicit allowlists, workspace scoping.
-- **Fully swappable:** core systems are traits (providers, channels, tools, memory, tunnels).
-- **No lock-in:** OpenAI-compatible provider support + pluggable custom endpoints.
-
-## Quick Start
-
-### Option 1: Homebrew (macOS/Linuxbrew)
+## Install
 
 ```bash
-brew install zeroclaw
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
-### Option 2: Clone + Bootstrap
+Or clone and run:
 
 ```bash
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
-./bootstrap.sh
+./install.sh
 ```
 
-> **Note:** Source builds require ~2GB RAM and ~6GB disk. For resource-constrained systems, use `./bootstrap.sh --prefer-prebuilt` to download a pre-built binary instead.
+The installer asks whether you want a prebuilt binary (fast, ~seconds) or a source build (slower, customisable). Both end the same way — `zeroclaw onboard` kicks off automatically.
 
-### Option 3: Cargo Install
+Flags:
+
+```
+./install.sh --prebuilt              # always prebuilt; don't ask
+./install.sh --source                # always build from source
+./install.sh --minimal               # kernel only (~6.6 MB)
+./install.sh --source --features agent-runtime,channel-discord  # custom feature set
+./install.sh --skip-onboard          # install only, run `zeroclaw onboard` later
+./install.sh --list-features         # print available feature flags
+```
+
+Platform-specific notes: [Linux](docs/book/src/setup/linux.md) · [macOS](docs/book/src/setup/macos.md) · [Windows](docs/book/src/setup/windows.md) · [Docker](docs/book/src/setup/container.md)
+
+## Quick start
 
 ```bash
-cargo install zeroclaw
+zeroclaw onboard                  # interactive onboard: provider, channels, agents, etc.
+zeroclaw agent -a <alias>         # interactive chat using the [agents.<alias>] entry
+zeroclaw service install          # register as systemd/launchctl/Windows Service
+zeroclaw service start            # run it always-on in the background
 ```
 
-### First Run
+Full walkthrough: [Quick start](docs/book/src/getting-started/quick-start.md) — or skip the safety gates with [YOLO mode](docs/book/src/getting-started/yolo.md) for dev boxes.
 
-```bash
-# Start the gateway (serves the Web Dashboard API/UI)
-zeroclaw gateway
+## What ZeroClaw does
 
-# Open the dashboard URL shown in startup logs
-# (default: http://127.0.0.1:3000/)
+- **Multi-channel** — one agent answering you across [every channel you configure](docs/book/src/channels/overview.md). Inbound messages from Discord, Telegram, Matrix, email, webhooks, CLI — all delivered to the same agent loop.
+- **Provider-agnostic** — [model providers](docs/book/src/providers/overview.md) are pluggable. Configure Anthropic, OpenAI, local Ollama, or any OpenAI-compatible endpoint. [Fallback chains and routing](docs/book/src/providers/fallback-and-routing.md) keep the agent running when a provider flakes.
+- **Security-first, with escape hatches** — default autonomy is `supervised`: medium-risk ops require approval, high-risk blocked. Workspace boundaries, command policy, OS-level sandboxes (Landlock / Bubblewrap / Seatbelt / Docker), and cryptographic [tool receipts](docs/book/src/security/tool-receipts.md) on every action. [YOLO mode](docs/book/src/getting-started/yolo.md) exists for trusted dev environments.
+- **Hardware-capable** — GPIO / I2C / SPI / USB on Raspberry Pi, STM32, Arduino, and ESP32 via the `Peripheral` trait. See [Hardware](docs/book/src/hardware/index.md).
+- **Gateway + dashboard** — HTTP / WebSocket gateway for clients, with a web dashboard for chat, memory browsing, config editing, cron management, and tool inspection.
+- **SOP engine** — event-triggered [Standard Operating Procedures](docs/book/src/sop/index.md) (MQTT / webhook / cron / peripheral) with approval gates and resumable runs.
+- **ACP** — IDE / editor integration via [Agent Client Protocol](docs/book/src/channels/acp.md) (JSON-RPC 2.0 over stdio).
 
-# Or chat directly
-zeroclaw chat "Hello!"
+## Configuration
+
+One TOML file at `~/.zeroclaw/config.toml`. Pointers:
+
+- [Provider configuration](docs/book/src/providers/configuration.md) — the universal `[providers.models.<type>.<alias>]` schema
+- [Channels overview](docs/book/src/channels/overview.md) — per-channel `[channels.<type>.<alias>]` blocks
+- [Security overview](docs/book/src/security/overview.md) — autonomy, sandboxing, tool receipts
+- [Full config reference](docs/book/src/reference/config.md) — generated from the live schema; every key documented
+
+A V3 config has at minimum four section headers (`<type>.<alias>` shaped) — a provider entry, an agent that references it, and a risk profile the agent gates against. See [Provider Configuration → Minimal working example](docs/book/src/providers/configuration.md#minimal-working-example) for the canonical four-section form with inline type/alias commentary.
+
+For standard OpenAI Codex subscription auth, swap the provider entry to:
+
+```toml
+[providers.models.openai.coding]   # type = openai; alias = coding (you choose)
+model = "gpt-5-codex"
+wire_api = "responses"
+requires_openai_auth = true
 ```
 
-For detailed setup options, see [docs/one-click-bootstrap.md](docs/one-click-bootstrap.md).
+…and point your agent at it with `model_provider = "openai.coding"`.
 
-### Installation Docs (Canonical Source)
+Notes:
 
-Use repository docs as the source of truth for install/setup instructions:
+- Normal OpenAI Codex subscription auth uses stored auth profiles, not an `api_key` on the provider entry.
+- Only set `api_key` / `uri` on `[providers.models.openai.<alias>]` when intentionally targeting a custom OpenAI-compatible gateway or endpoint.
+- If you see `provider streaming failed, falling back to non-streaming chat`, ZeroClaw retries the same request in non-streaming mode. Check `zeroclaw auth status` before changing provider config.
 
-- [README Quick Start](#quick-start)
-- [docs/one-click-bootstrap.md](docs/one-click-bootstrap.md)
-- [docs/getting-started/README.md](docs/getting-started/README.md)
+## Architecture
 
-Issue comments can provide context, but they are not canonical installation documentation.
+```
+┌──────────────────────────────────────────────────────────────┐
+│            channels       gateway        ACP                 │
+│          (30+ adapters)   (REST/WS)    (JSON-RPC)            │
+│                        ↓                                     │
+│                   ZeroClaw runtime                           │
+│         ┌──────────┬──────────┬──────────┐                   │
+│         │  agent   │ security │   SOP    │                   │
+│         │   loop   │  policy  │  engine  │                   │
+│         └──────────┴──────────┴──────────┘                   │
+│              ↓          ↓           ↓                        │
+│          providers    tools      memory                      │
+│         (Anthropic,  (shell,    (SQLite,                     │
+│          OpenAI,     browser,    embeddings)                 │
+│          Ollama,     HTTP,                                   │
+│          ~20 more)   hardware)                               │
+└──────────────────────────────────────────────────────────────┘
+```
 
-## Benchmark Snapshot (ZeroClaw vs OpenClaw, Reproducible)
-
-Local machine quick benchmark (macOS arm64, Feb 2026) normalized for 0.8GHz edge hardware.
-
-|                           | OpenClaw      | NanoBot        | PicoClaw        | ZeroClaw 🦀          |
-| ------------------------- | ------------- | -------------- | --------------- | -------------------- |
-| **Language**              | TypeScript    | Python         | Go              | **Rust**             |
-| **RAM**                   | > 1GB         | > 100MB        | < 10MB          | **< 5MB**            |
-| **Startup (0.8GHz core)** | > 500s        | > 30s          | < 1s            | **< 10ms**           |
-| **Binary Size**           | ~28MB (dist)  | N/A (Scripts)  | ~8MB            | **~8.8 MB**          |
-| **Cost**                  | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | **Any hardware** |
-
-> Notes: ZeroClaw results are measured on release builds using `/usr/bin/time -l`. OpenClaw requires Node.js runtime (typically ~390MB additional memory overhead), while NanoBot requires Python runtime. PicoClaw and ZeroClaw are static binaries. The RAM figures above are runtime memory; build-time compilation requirements are higher.
-
-<p align="center">
-  <img src="zero-claw.jpeg" alt="ZeroClaw vs OpenClaw Comparison" width="800" />
-</p>
-
----
-
-For full documentation, see [`docs/README.md`](docs/README.md) | [`docs/SUMMARY.md`](docs/SUMMARY.md)
-
-## ⚠️ Official Repository & Impersonation Warning
-
-**This is the only official ZeroClaw repository:**
-
-> https://github.com/zeroclaw-labs/zeroclaw
-
-Any other repository, organization, domain, or package claiming to be "ZeroClaw" or implying affiliation with ZeroClaw Labs is **unauthorized and not affiliated with this project**. Known unauthorized forks will be listed in [TRADEMARK.md](TRADEMARK.md).
-
-If you encounter impersonation or trademark misuse, please [open an issue](https://github.com/zeroclaw-labs/zeroclaw/issues).
-
----
-
-## License
-
-ZeroClaw is dual-licensed for maximum openness and contributor protection:
-
-| License | Use case |
-|---|---|
-| [MIT](LICENSE-MIT) | Open-source, research, academic, personal use |
-| [Apache 2.0](LICENSE-APACHE) | Patent protection, institutional, commercial deployment |
-
-You may choose either license. **Contributors automatically grant rights under both** — see [CLA.md](CLA.md) for the full contributor agreement.
+Full detail with Mermaid diagrams: [Architecture overview](docs/book/src/architecture/overview.md) · [Request lifecycle](docs/book/src/architecture/request-lifecycle.md) · [Crates](docs/book/src/architecture/crates.md).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md). Implement a trait, submit a PR.
+Start with [how to contribute](docs/book/src/contributing/how-to.md). Larger changes go through the [RFC process](docs/book/src/contributing/rfcs.md). Real-time chat lives on [Discord](https://discord.com/invite/wDshRVqRjx) (the best way to reach the team); durable work tracking is on [GitHub issues](https://github.com/zeroclaw-labs/zeroclaw/issues).
 
----
+Good places to start:
 
-**ZeroClaw** — Zero overhead. Zero compromise. Deploy anywhere. Swap anything. 🦀
+- New channel → `crates/zeroclaw-channels/`
+- New provider → `crates/zeroclaw-providers/`
+- New tool → `crates/zeroclaw-tools/`
+- Hardware support → `crates/zeroclaw-hardware/`
+- Docs → `docs/book/src/`
 
-## Star History
+AI-assisted PRs are welcome; see [Contribution culture (RFC #5615)](https://github.com/zeroclaw-labs/zeroclaw/issues/5615) for the co-authorship norms.
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+<!-- END:RECENT_CONTRIBUTORS -->
+
+## Security
+
+Do not file public issues for security vulnerabilities. Email `security@zeroclaw.dev`. See [SECURITY.md](SECURITY.md) for the full policy.
+
+## Official repository & impersonation notice
+
+This is the only official ZeroClaw repository:
+
+> <https://github.com/zeroclaw-labs/zeroclaw>
+
+Any other repository, organization, domain, or package claiming to be "ZeroClaw" or implying affiliation with ZeroClaw Labs is **unauthorized and not affiliated with this project**.
+
+## License
+
+Dual-licensed: [MIT](LICENSE-MIT) OR [Apache 2.0](LICENSE-APACHE). You may choose either. Contributors automatically grant rights under both — see [CLA](docs/book/src/contributing/cla.md). The **ZeroClaw** name and logo are trademarks of ZeroClaw Labs.
+
+## Credits
+
+Built and maintained by the community — original creator [@theonlyhennygod](https://github.com/theonlyhennygod); project lead [@JordanTheJet](https://github.com/JordanTheJet). Full maintainer list in [Communication](docs/book/src/contributing/communication.md).
+
+Thanks to the communities that incubated early work: **Harvard University**, **MIT**, **Sundai Club**, and every contributor pushing it forward.
 
 <p align="center">
   <a href="https://www.star-history.com/#zeroclaw-labs/zeroclaw&type=date&legend=top-left">
@@ -192,5 +178,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md). Implement a trait, 
      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
     </picture>
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=zeroclaw-labs/zeroclaw" alt="ZeroClaw contributors" />
   </a>
 </p>
