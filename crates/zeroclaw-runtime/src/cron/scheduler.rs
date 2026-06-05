@@ -7,6 +7,7 @@ use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
+use sha2::{Digest, Sha256};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -32,6 +33,14 @@ pub enum CronDeliveryContext {
 }
 
 impl CronDeliveryContext {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Scheduled => "scheduled",
+            Self::ToolManual => "tool_manual",
+            Self::GatewayManual => "gateway_manual",
+        }
+    }
+
     fn failure_message(self, best_effort: bool) -> &'static str {
         match (self, best_effort) {
             (Self::Scheduled, true) => "Cron delivery failed (best_effort)",
@@ -59,7 +68,7 @@ pub async fn deliver_and_classify_run_result(
 ) -> CronDeliveryOutcome {
     let mut status = if success { "ok" } else { "error" }.to_string();
 
-    if let Err(e) = deliver_if_configured(config, job, &output).await {
+    if let Err(e) = deliver_if_configured(config, job, &output, context).await {
         // Cron add-time accepts dangling delivery refs (the job's channel
         // may not be provisioned yet); the loudly-logged warn here is
         // the scheduler-side half of that contract. Manual trigger paths
@@ -744,7 +753,12 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
     }
 }
 
-async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
+async fn deliver_if_configured(
+    config: &Config,
+    job: &CronJob,
+    output: &str,
+    context: CronDeliveryContext,
+) -> Result<()> {
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
         return Ok(());
@@ -771,14 +785,73 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         anyhow::Error::msg("delivery.to is required for announce mode")
     })?;
 
-    deliver_announcement(
+    let thread_id = delivery.thread_id.as_deref();
+    let delivery_key = cron_delivery_key(job, delivery, channel, target, output, context);
+    let reserved = crate::cron::reserve_delivery(
         config,
+        &delivery_key,
+        &job.id,
         channel,
         target,
-        delivery.thread_id.as_deref(),
+        thread_id,
         output,
-    )
-    .await
+    )?;
+    if !reserved {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "job_id": job.id,
+                    "agent_alias": job.agent_alias,
+                    "delivery_key": delivery_key,
+                    "channel": channel,
+                    "target": target,
+                    "context": context.as_str()
+                })),
+            "Cron delivery skipped: duplicate delivery reservation"
+        );
+        return Ok(());
+    }
+
+    deliver_announcement(config, channel, target, thread_id, output).await
+}
+
+fn cron_delivery_key(
+    job: &CronJob,
+    delivery: &DeliveryConfig,
+    channel: &str,
+    target: &str,
+    output: &str,
+    context: CronDeliveryContext,
+) -> String {
+    let thread_id = delivery.thread_id.as_deref().unwrap_or("");
+    match context {
+        CronDeliveryContext::Scheduled => format!(
+            "cron-delivery:v1:{}:{}:{}:{}:{}:{}",
+            context.as_str(),
+            job.id,
+            job.next_run.to_rfc3339(),
+            channel,
+            target,
+            thread_id
+        ),
+        CronDeliveryContext::ToolManual | CronDeliveryContext::GatewayManual => format!(
+            "cron-delivery:v1:{}:{}:{}:{}:{}:{}",
+            context.as_str(),
+            job.id,
+            channel,
+            target,
+            thread_id,
+            sha256_hex(output)
+        ),
+    }
+}
+
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 /// Delivery function type — takes owned values so the returned future is 'static.
@@ -1861,6 +1934,91 @@ mod tests {
         assert!(outcome.output.starts_with("delivery failed:"));
     }
 
+    #[test]
+    fn scheduled_delivery_key_is_stable_for_same_occurrence() {
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("telegram".into()),
+            to: Some("123456".into()),
+            thread_id: Some("thread-a".into()),
+            best_effort: false,
+        };
+        let channel = job.delivery.channel.clone().unwrap();
+        let target = job.delivery.to.clone().unwrap();
+
+        let first = cron_delivery_key(
+            &job,
+            &job.delivery,
+            &channel,
+            &target,
+            "same output",
+            CronDeliveryContext::Scheduled,
+        );
+        let retry = cron_delivery_key(
+            &job,
+            &job.delivery,
+            &channel,
+            &target,
+            "same output",
+            CronDeliveryContext::Scheduled,
+        );
+        job.next_run += ChronoDuration::days(1);
+        let next_occurrence = cron_delivery_key(
+            &job,
+            &job.delivery,
+            &channel,
+            &target,
+            "same output",
+            CronDeliveryContext::Scheduled,
+        );
+
+        assert_eq!(first, retry);
+        assert_ne!(first, next_occurrence);
+    }
+
+    #[test]
+    fn manual_delivery_key_is_stable_for_output_replay() {
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("telegram".into()),
+            to: Some("123456".into()),
+            thread_id: None,
+            best_effort: false,
+        };
+        let channel = job.delivery.channel.clone().unwrap();
+        let target = job.delivery.to.clone().unwrap();
+
+        let first = cron_delivery_key(
+            &job,
+            &job.delivery,
+            &channel,
+            &target,
+            "same output",
+            CronDeliveryContext::ToolManual,
+        );
+        let retry = cron_delivery_key(
+            &job,
+            &job.delivery,
+            &channel,
+            &target,
+            "same output",
+            CronDeliveryContext::ToolManual,
+        );
+        let changed_output = cron_delivery_key(
+            &job,
+            &job.delivery,
+            &channel,
+            &target,
+            "different output",
+            CronDeliveryContext::ToolManual,
+        );
+
+        assert_eq!(first, retry);
+        assert_ne!(first, changed_output);
+    }
+
     #[tokio::test]
     async fn persist_job_result_at_schedule_without_delete_after_run_is_disabled() {
         let tmp = TempDir::new().unwrap();
@@ -1903,7 +2061,11 @@ mod tests {
         let job = test_job("echo ok");
 
         // Default delivery mode is not "announce", so should be a no-op.
-        assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
+        assert!(
+            deliver_if_configured(&config, &job, "x", CronDeliveryContext::Scheduled)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

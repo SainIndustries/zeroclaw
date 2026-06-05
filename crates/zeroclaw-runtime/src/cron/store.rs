@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
 use rusqlite::{Connection, OpenFlags, params};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroclaw_config::schema::Config;
 
@@ -604,6 +605,40 @@ pub fn record_run(
     })
 }
 
+pub fn reserve_delivery(
+    config: &Config,
+    delivery_key: &str,
+    job_id: &str,
+    channel: &str,
+    target: &str,
+    thread_id: Option<&str>,
+    output: &str,
+) -> Result<bool> {
+    let created_at = Utc::now().to_rfc3339();
+    let output_sha256 = sha256_hex(output);
+
+    with_initialized_connection(config, |conn| {
+        let inserted = conn
+            .execute(
+                "INSERT OR IGNORE INTO cron_deliveries (
+                    delivery_key, job_id, channel, target, thread_id, output_sha256, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    delivery_key,
+                    job_id,
+                    channel,
+                    target,
+                    thread_id,
+                    output_sha256,
+                    created_at,
+                ],
+            )
+            .context("Failed to reserve cron delivery")?;
+
+        Ok(inserted == 1)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn persist_run_result(
     config: &Config,
@@ -724,6 +759,12 @@ fn truncate_cron_output(output: &str) -> String {
     let mut truncated = output[..cutoff].to_string();
     truncated.push_str(TRUNCATED_OUTPUT_MARKER);
     truncated
+}
+
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<CronRun>> {
@@ -1374,7 +1415,20 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_cron_runs_job_id ON cron_runs(job_id);
         CREATE INDEX IF NOT EXISTS idx_cron_runs_started_at ON cron_runs(started_at);
-        CREATE INDEX IF NOT EXISTS idx_cron_runs_job_started ON cron_runs(job_id, started_at);",
+        CREATE INDEX IF NOT EXISTS idx_cron_runs_job_started ON cron_runs(job_id, started_at);
+
+        CREATE TABLE IF NOT EXISTS cron_deliveries (
+            delivery_key  TEXT PRIMARY KEY,
+            job_id        TEXT NOT NULL,
+            channel       TEXT NOT NULL,
+            target        TEXT NOT NULL,
+            thread_id     TEXT,
+            output_sha256 TEXT NOT NULL,
+            created_at    TEXT NOT NULL,
+            FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_cron_deliveries_job_id ON cron_deliveries(job_id);
+        CREATE INDEX IF NOT EXISTS idx_cron_deliveries_created_at ON cron_deliveries(created_at);",
     )
     .context("Failed to initialize cron schema")?;
 
@@ -2040,6 +2094,48 @@ mod tests {
 
         let runs = list_runs(&config, &job.id, 10).unwrap();
         assert_eq!(runs.len(), 2);
+    }
+
+    #[test]
+    fn reserve_delivery_rejects_duplicate_key() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        let first = reserve_delivery(
+            &config,
+            "cron-delivery:v1:scheduled:job:occurrence:telegram:123:",
+            &job.id,
+            "telegram",
+            "123",
+            None,
+            "done",
+        )
+        .unwrap();
+        let duplicate = reserve_delivery(
+            &config,
+            "cron-delivery:v1:scheduled:job:occurrence:telegram:123:",
+            &job.id,
+            "telegram",
+            "123",
+            None,
+            "done",
+        )
+        .unwrap();
+        let different_occurrence = reserve_delivery(
+            &config,
+            "cron-delivery:v1:scheduled:job:next-occurrence:telegram:123:",
+            &job.id,
+            "telegram",
+            "123",
+            None,
+            "done",
+        )
+        .unwrap();
+
+        assert!(first);
+        assert!(!duplicate);
+        assert!(different_occurrence);
     }
 
     #[test]
