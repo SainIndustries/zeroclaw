@@ -17,7 +17,7 @@ pub struct AuraUsagePayload {
     pub tokens: u64,
     pub channel: String,
     pub source: String,
-    pub provider: String,
+    pub model_provider: String,
     pub model: String,
     pub metadata: AuraUsageMetadata,
 }
@@ -44,26 +44,22 @@ impl AuraUsageObserver {
             .ok()
             .map(|value| value.trim().trim_end_matches('/').to_string())
         else {
-            tracing::debug!("Aura usage reporting disabled: AURA_API_URL is not set");
             return None;
         };
         let Some(agent_id) = std::env::var("AGENT_ID")
             .ok()
             .map(|value| value.trim().to_string())
         else {
-            tracing::debug!("Aura usage reporting disabled: AGENT_ID is not set");
             return None;
         };
         let Some(gateway_token) = std::env::var("GATEWAY_TOKEN")
             .ok()
             .map(|value| value.trim().to_string())
         else {
-            tracing::debug!("Aura usage reporting disabled: GATEWAY_TOKEN is not set");
             return None;
         };
 
         if api_url.is_empty() || agent_id.is_empty() || gateway_token.is_empty() {
-            tracing::debug!("Aura usage reporting disabled: one or more required values are empty");
             return None;
         }
 
@@ -99,7 +95,7 @@ impl AuraUsageObserver {
 
     fn payload_for_event(&self, event: &ObserverEvent) -> Option<AuraUsagePayload> {
         let ObserverEvent::LlmResponse {
-            provider,
+            model_provider,
             model,
             success: true,
             input_tokens,
@@ -118,7 +114,7 @@ impl AuraUsageObserver {
             return None;
         }
 
-        Some(build_payload(provider, model, tokens, attribution))
+        Some(build_payload(model_provider, model, tokens, attribution))
     }
 
     fn report_url(&self) -> Option<String> {
@@ -131,7 +127,7 @@ impl AuraUsageObserver {
 }
 
 fn build_payload(
-    provider: &str,
+    model_provider: &str,
     model: &str,
     tokens: u64,
     attribution: &LlmUsageAttribution,
@@ -139,7 +135,12 @@ fn build_payload(
     let cron_part = attribution.cron_job_id.as_deref().unwrap_or("none");
     let report_id = format!(
         "zeroclaw:{}:{}:{}:{}:{}:{}",
-        attribution.turn_id, attribution.iteration, provider, model, attribution.channel, cron_part
+        attribution.turn_id,
+        attribution.iteration,
+        model_provider,
+        model,
+        attribution.channel,
+        cron_part
     );
 
     AuraUsagePayload {
@@ -147,7 +148,7 @@ fn build_payload(
         tokens,
         channel: attribution.channel.clone(),
         source: attribution.source.clone(),
-        provider: provider.to_string(),
+        model_provider: model_provider.to_string(),
         model: model.to_string(),
         metadata: AuraUsageMetadata {
             turn_id: attribution.turn_id.clone(),
@@ -172,8 +173,11 @@ impl Observer for AuraUsageObserver {
         let client = self.client.clone();
 
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            tracing::warn!(
-                report_id = %payload.report_id,
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"report_id": payload.report_id})),
                 "Aura usage report skipped because no Tokio runtime is active"
             );
             return;
@@ -189,18 +193,10 @@ impl Observer for AuraUsageObserver {
             {
                 Ok(response) if response.status().is_success() => {}
                 Ok(response) => {
-                    tracing::warn!(
-                        status = %response.status(),
-                        report_id = %payload.report_id,
-                        "Aura usage report was rejected"
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"status": response.status().to_string(), "report_id": payload.report_id})), "Aura usage report was rejected");
                 }
                 Err(error) => {
-                    tracing::warn!(
-                        report_id = %payload.report_id,
-                        error = %error,
-                        "Aura usage report failed"
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"report_id": payload.report_id, "error": format!("{}", error)})), "Aura usage report failed");
                 }
             }
         });
@@ -224,7 +220,7 @@ mod tests {
 
     fn success_event(attribution: LlmUsageAttribution) -> ObserverEvent {
         ObserverEvent::LlmResponse {
-            provider: "bedrock".to_string(),
+            model_provider: "bedrock".to_string(),
             model: "claude-sonnet".to_string(),
             duration: Duration::from_millis(42),
             success: true,
@@ -260,7 +256,7 @@ mod tests {
         assert_eq!(payload.tokens, 125);
         assert_eq!(payload.channel, "proactive");
         assert_eq!(payload.source, "zeroclaw_cron");
-        assert_eq!(payload.provider, "bedrock");
+        assert_eq!(payload.model_provider, "bedrock");
         assert_eq!(payload.model, "claude-sonnet");
         assert_eq!(payload.metadata.cron_job_id.as_deref(), Some("job-1"));
         assert_eq!(
@@ -288,7 +284,7 @@ mod tests {
     fn skips_failed_and_zero_token_responses() {
         let observer = AuraUsageObserver::enabled_for_test("https://aura.test", "agent-1", "token");
         let failed = ObserverEvent::LlmResponse {
-            provider: "bedrock".to_string(),
+            model_provider: "bedrock".to_string(),
             model: "claude-sonnet".to_string(),
             duration: Duration::from_millis(42),
             success: false,
@@ -300,7 +296,7 @@ mod tests {
         assert!(observer.payload_for_event(&failed).is_none());
 
         let zero = ObserverEvent::LlmResponse {
-            provider: "bedrock".to_string(),
+            model_provider: "bedrock".to_string(),
             model: "claude-sonnet".to_string(),
             duration: Duration::from_millis(42),
             success: true,

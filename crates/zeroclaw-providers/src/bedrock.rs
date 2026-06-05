@@ -352,11 +352,13 @@ impl AwsCredentials {
             .to_string();
         let secret_access_key = creds_json["SecretAccessKey"]
             .as_str()
-            .ok_or_else(|| {
-                anyhow::anyhow!("Missing SecretAccessKey in ECS credential response")
-            })?
+            .ok_or_else(|| anyhow::anyhow!("Missing SecretAccessKey in ECS credential response"))?
             .to_string();
         let session_token = creds_json["Token"].as_str().map(|s| s.to_string());
+        let expires_at = creds_json["Expiration"]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
 
         let region = env_optional("AWS_REGION")
             .or_else(|| env_optional("AWS_DEFAULT_REGION"))
@@ -373,7 +375,7 @@ impl AwsCredentials {
             secret_access_key,
             session_token,
             region,
-            expires_at: None,
+            expires_at,
         })
     }
 
@@ -925,7 +927,8 @@ impl BedrockModelProvider {
         }
     }
 
-    /// Resolve auth: use cached if available, otherwise try env vars then IMDS.
+    /// Resolve auth: use cached if available, otherwise try bearer token then
+    /// the SigV4 resolution chain (env, credential_process, ECS, IMDS).
     async fn resolve_auth(&self) -> anyhow::Result<BedrockAuth> {
         // If we already have auth cached, re-resolve from the same source.
         if let Some(ref auth) = self.auth {
@@ -944,15 +947,9 @@ impl BedrockModelProvider {
         if let Some(token) = env_optional("BEDROCK_API_KEY") {
             return Ok(BedrockAuth::BearerToken(token));
         }
-        // Fall back to SigV4.
-        if let Ok(creds) = AwsCredentials::from_env() {
-            return Ok(BedrockAuth::SigV4(creds));
-        }
-        if let Ok(creds) = AwsCredentials::from_credential_process() {
-            self.cache_credentials(&creds);
-            return Ok(BedrockAuth::SigV4(creds));
-        }
-        Ok(BedrockAuth::SigV4(AwsCredentials::from_imds().await?))
+        let creds = AwsCredentials::resolve().await?;
+        self.cache_credentials(&creds);
+        Ok(BedrockAuth::SigV4(creds))
     }
 
     // ── Cache heuristics (same thresholds as AnthropicModelProvider) ──
@@ -2681,7 +2678,8 @@ region=ap-southeast-1
     #[test]
     fn resolve_ecs_endpoint_uses_relative_uri() {
         let _env_lock = env_lock();
-        let _rel_guard = EnvGuard::set("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", Some("/creds/abc"));
+        let _rel_guard =
+            EnvGuard::set("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", Some("/creds/abc"));
         let _full_guard = EnvGuard::set("AWS_CONTAINER_CREDENTIALS_FULL_URI", None);
         let _tok_guard = EnvGuard::set("AWS_CONTAINER_AUTHORIZATION_TOKEN", None);
 
@@ -2696,13 +2694,19 @@ region=ap-southeast-1
     fn resolve_ecs_endpoint_uses_full_uri_with_auth() {
         let _env_lock = env_lock();
         let _rel_guard = EnvGuard::set("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", None);
-        let _full_guard = EnvGuard::set("AWS_CONTAINER_CREDENTIALS_FULL_URI", Some("https://10.0.0.1/custom/creds"));
+        let _full_guard = EnvGuard::set(
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            Some("https://10.0.0.1/custom/creds"),
+        );
         let _tok_guard = EnvGuard::set("AWS_CONTAINER_AUTHORIZATION_TOKEN", Some("mytoken"));
 
         let result = resolve_ecs_endpoint();
         assert_eq!(
             result,
-            Some(("https://10.0.0.1/custom/creds".to_string(), Some("mytoken".to_string())))
+            Some((
+                "https://10.0.0.1/custom/creds".to_string(),
+                Some("mytoken".to_string())
+            ))
         );
     }
 

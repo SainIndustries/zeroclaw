@@ -333,7 +333,7 @@ fn claim_overdue_jobs(
          ORDER BY next_run ASC{limit_clause}",
     );
 
-    with_connection(config, |conn| {
+    with_initialized_connection(config, |conn| {
         let candidates = {
             let mut stmt = conn.prepare(&query)?;
             let mut jobs = Vec::new();
@@ -342,9 +342,16 @@ fn claim_overdue_jobs(
                 for row in rows {
                     match row {
                         Ok(job) => jobs.push(job),
-                        Err(e) => {
-                            tracing::warn!("Skipping cron job with unparseable row data: {e}")
-                        }
+                        Err(e) => ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "Skipping cron job with unparseable row data"
+                        ),
                     }
                 }
             } else {
@@ -352,9 +359,16 @@ fn claim_overdue_jobs(
                 for row in rows {
                     match row {
                         Ok(job) => jobs.push(job),
-                        Err(e) => {
-                            tracing::warn!("Skipping cron job with unparseable row data: {e}")
-                        }
+                        Err(e) => ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "Skipping cron job with unparseable row data"
+                        ),
                     }
                 }
             }

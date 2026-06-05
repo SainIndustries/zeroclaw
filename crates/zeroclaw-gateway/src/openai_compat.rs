@@ -6,21 +6,31 @@
 //! dispatch to whichever provider the agent is configured for (Bedrock in prod).
 
 use axum::{
+    Json,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
     },
-    Json,
 };
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::AppState;
+
+fn default_agent_alias(config: &zeroclaw_config::schema::Config) -> Result<String, String> {
+    config
+        .agents
+        .iter()
+        .find(|(_, agent)| agent.enabled)
+        .or_else(|| config.agents.iter().next())
+        .map(|(alias, _)| alias.clone())
+        .ok_or_else(|| "no configured agents available".to_string())
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -98,8 +108,7 @@ pub async fn handle_chat_completions(
     // Outbound channel: SseFrame -> HTTP SSE stream
     let (out_tx, out_rx) = mpsc::channel::<SseFrame>(64);
     // Turn-event channel: Agent -> forwarder
-    let (evt_tx, mut evt_rx) =
-        mpsc::channel::<zeroclaw_runtime::agent::TurnEvent>(64);
+    let (evt_tx, mut evt_rx) = mpsc::channel::<zeroclaw_runtime::agent::TurnEvent>(64);
 
     // ── Forwarder task: TurnEvent -> SseFrame ────────────────────────────────
     let completion_id_fwd = completion_id.clone();
@@ -118,12 +127,8 @@ pub async fn handle_chat_completions(
 
         let mut tool_call_index: u32 = 0;
         while let Some(evt) = evt_rx.recv().await {
-            let frames = translate_turn_event(
-                evt,
-                &completion_id_fwd,
-                &model_fwd,
-                &mut tool_call_index,
-            );
+            let frames =
+                translate_turn_event(evt, &completion_id_fwd, &model_fwd, &mut tool_call_index);
             for frame in frames {
                 if out_tx_fwd.send(SseFrame::Delta(frame)).await.is_err() {
                     return;
@@ -141,11 +146,17 @@ pub async fn handle_chat_completions(
     tokio::spawn(async move {
         // Mirror ws::handle_socket: build an Agent from the current config.
         // The config lock is released immediately after cloning.
-        let config = state.config.lock().clone();
-        let mut agent = match zeroclaw_runtime::agent::Agent::from_config(&config).await {
-            Ok(a) => a,
+        let config = state.config.read().clone();
+        let agent_alias = match default_agent_alias(&config) {
+            Ok(alias) => alias,
             Err(e) => {
-                tracing::error!(error = %e, "Agent init failed for /v1/chat/completions");
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e})),
+                    "Agent init failed for /v1/chat/completions"
+                );
                 let _ = out_tx
                     .send(SseFrame::Delta(build_chunk(
                         &completion_id,
@@ -158,6 +169,29 @@ pub async fn handle_chat_completions(
                 return;
             }
         };
+        let mut agent =
+            match zeroclaw_runtime::agent::Agent::from_config(&config, &agent_alias).await {
+                Ok(a) => a,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "Agent init failed for /v1/chat/completions"
+                    );
+                    let _ = out_tx
+                        .send(SseFrame::Delta(build_chunk(
+                            &completion_id,
+                            &model,
+                            serde_json::json!({}),
+                            Some("error"),
+                        )))
+                        .await;
+                    let _ = out_tx.send(SseFrame::Done).await;
+                    return;
+                }
+            };
 
         // Scope memory consolidation to this session (Daily/Core fact rows
         // tagged with the same session_id). When None, falls back to the
@@ -169,16 +203,9 @@ pub async fn handle_chat_completions(
         // Seed prior turns from SqliteSessionBackend so the agent has
         // continuity within the conversation. Skipped silently if either
         // the backend is disabled (config) or no session header was sent.
-        if let (Some(backend), Some(key)) =
-            (&state.session_backend, &session_key_drv)
-        {
+        if let (Some(backend), Some(key)) = (&state.session_backend, &session_key_drv) {
             let prior = backend.load(key);
             if !prior.is_empty() {
-                tracing::debug!(
-                    session_key = %key,
-                    prior_count = prior.len(),
-                    "openai_compat: seeding agent with prior history"
-                );
                 agent.seed_history(&prior);
             }
         }
@@ -192,7 +219,7 @@ pub async fn handle_chat_completions(
         // (one channel partner = one in-flight request at a time). If we
         // ever observe interleaved turns on the same session in production,
         // add session_queue.acquire(&session_key).await before turn_streamed.
-        let result = agent.turn_streamed(&user_message_drv, evt_tx).await;
+        let result = agent.turn_streamed(&user_message_drv, evt_tx, None).await;
 
         // Wait for the forwarder to fully drain queued TurnEvents into
         // out_tx before we emit finish + [DONE]. Without this join, the
@@ -205,7 +232,13 @@ pub async fn handle_chat_completions(
         let finish = match &result {
             Ok(_) => "stop",
             Err(e) => {
-                tracing::warn!("/v1/chat/completions turn_streamed error: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "/v1/chat/completions turn_streamed error"
+                );
                 "error"
             }
         };
@@ -219,25 +252,35 @@ pub async fn handle_chat_completions(
             .await;
         let _ = out_tx.send(SseFrame::Done).await;
 
-        if let Ok(ref response) = result {
+        if let Ok((ref response, _new_messages)) = result {
             // Persist user + assistant to the session backend if a session
             // key was provided and the backend is configured.
             if let (Some(backend), Some(key)) =
                 (state.session_backend.as_ref(), session_key_drv.as_ref())
             {
-                let user_msg = zeroclaw_api::provider::ChatMessage::user(user_message_drv.clone());
+                let user_msg =
+                    zeroclaw_api::model_provider::ChatMessage::user(user_message_drv.clone());
                 if let Err(e) = backend.append(key, &user_msg) {
-                    tracing::warn!(
-                        session_key = %key,
-                        error = %e,
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(
+                                ::serde_json::json!({"session_key": key, "error": format!("{}", e)})
+                            ),
                         "openai_compat: failed to persist user message"
                     );
                 }
-                let assistant_msg = zeroclaw_api::provider::ChatMessage::assistant(response.clone());
+                let assistant_msg =
+                    zeroclaw_api::model_provider::ChatMessage::assistant(response.clone());
                 if let Err(e) = backend.append(key, &assistant_msg) {
-                    tracing::warn!(
-                        session_key = %key,
-                        error = %e,
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(
+                                ::serde_json::json!({"session_key": key, "error": format!("{}", e)})
+                            ),
                         "openai_compat: failed to persist assistant message"
                     );
                 }
@@ -246,34 +289,13 @@ pub async fn handle_chat_completions(
                 // for UI indicators; the gateway-side session_state column is left
                 // untouched on the OpenAI-compat path.
             }
-
-            // Fire-and-forget memory consolidation, mirroring ws::process_chat_message.
-            if state.auto_save {
-                let mem = state.mem.clone();
-                let provider = state.provider.clone();
-                let model_consolidate = model.clone();
-                let user_msg = user_message_drv.clone();
-                let assistant_resp = response.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
-                        provider.as_ref(),
-                        &model_consolidate,
-                        mem.as_ref(),
-                        &user_msg,
-                        &assistant_resp,
-                    )
-                    .await
-                    {
-                        tracing::debug!("OpenAI-compat memory consolidation skipped: {e}");
-                    }
-                });
-            }
         }
     });
 
-    let stream = ReceiverStream::new(out_rx)
-        .map(|frame| Ok::<Event, Infallible>(frame.to_event()));
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
+    let stream = ReceiverStream::new(out_rx).map(|frame| Ok::<Event, Infallible>(frame.to_event()));
+    Ok(Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response())
 }
 
 /// Non-streaming path: run `Agent::turn` synchronously and return a single
@@ -288,11 +310,19 @@ async fn handle_non_streaming(
 ) -> Result<Response, (StatusCode, String)> {
     let session_key = session_id.as_ref().map(|id| format!("gw_{id}"));
 
-    let config = state.config.lock().clone();
-    let mut agent = zeroclaw_runtime::agent::Agent::from_config(&config)
+    let config = state.config.read().clone();
+    let agent_alias =
+        default_agent_alias(&config).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let mut agent = zeroclaw_runtime::agent::Agent::from_config(&config, &agent_alias)
         .await
         .map_err(|e| {
-            tracing::error!(error = %e, "Agent init failed for non-streaming /v1/chat/completions");
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Agent init failed for non-streaming /v1/chat/completions"
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("agent init failed: {e}"),
@@ -303,16 +333,9 @@ async fn handle_non_streaming(
         agent.set_memory_session_id(Some(id.clone()));
     }
 
-    if let (Some(backend), Some(key)) =
-        (state.session_backend.as_ref(), session_key.as_ref())
-    {
+    if let (Some(backend), Some(key)) = (state.session_backend.as_ref(), session_key.as_ref()) {
         let prior = backend.load(key);
         if !prior.is_empty() {
-            tracing::debug!(
-                session_key = %key,
-                prior_count = prior.len(),
-                "openai_compat (non-stream): seeding agent with prior history"
-            );
             agent.seed_history(&prior);
         }
     }
@@ -323,29 +346,42 @@ async fn handle_non_streaming(
     // ever observe interleaved turns on the same session in production,
     // add session_queue.acquire(&session_key).await before agent.turn.
     let response_text = agent.turn(&user_message).await.map_err(|e| {
-        tracing::warn!(error = %e, "non-streaming /v1/chat/completions turn error");
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+            "non-streaming /v1/chat/completions turn error"
+        );
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("turn failed: {e}"),
         )
     })?;
 
-    if let (Some(backend), Some(key)) =
-        (state.session_backend.as_ref(), session_key.as_ref())
-    {
-        let user_msg = zeroclaw_api::provider::ChatMessage::user(user_message.clone());
+    if let (Some(backend), Some(key)) = (state.session_backend.as_ref(), session_key.as_ref()) {
+        let user_msg = zeroclaw_api::model_provider::ChatMessage::user(user_message.clone());
         if let Err(e) = backend.append(key, &user_msg) {
-            tracing::warn!(
-                session_key = %key,
-                error = %e,
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(
+                        ::serde_json::json!({"session_key": key, "error": format!("{}", e)})
+                    ),
                 "openai_compat (non-stream): failed to persist user message"
             );
         }
-        let assistant_msg = zeroclaw_api::provider::ChatMessage::assistant(response_text.clone());
+        let assistant_msg =
+            zeroclaw_api::model_provider::ChatMessage::assistant(response_text.clone());
         if let Err(e) = backend.append(key, &assistant_msg) {
-            tracing::warn!(
-                session_key = %key,
-                error = %e,
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(
+                        ::serde_json::json!({"session_key": key, "error": format!("{}", e)})
+                    ),
                 "openai_compat (non-stream): failed to persist assistant message"
             );
         }
@@ -353,29 +389,6 @@ async fn handle_non_streaming(
         // Aura tracks turn state (idle/running/error) in its own webapp DB
         // for UI indicators; the gateway-side session_state column is left
         // untouched on the OpenAI-compat path.
-    }
-
-    if state.auto_save {
-        let mem = state.mem.clone();
-        let provider = state.provider.clone();
-        let model_consolidate = model.clone();
-        let user_msg = user_message.clone();
-        let assistant_resp = response_text.clone();
-        tokio::spawn(async move {
-            if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
-                provider.as_ref(),
-                &model_consolidate,
-                mem.as_ref(),
-                &user_msg,
-                &assistant_resp,
-            )
-            .await
-            {
-                tracing::debug!(
-                    "non-streaming /v1/chat/completions memory consolidation skipped: {e}"
-                );
-            }
-        });
     }
 
     let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
@@ -422,10 +435,7 @@ fn read_session_id(headers: &HeaderMap) -> Option<String> {
 ///      (`PairingGuard::is_authenticated`).
 ///
 /// If neither matches, or the header is absent, returns `401 Unauthorized`.
-fn authorize(
-    headers: &HeaderMap,
-    state: &AppState,
-) -> Result<(), (StatusCode, String)> {
+fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, String)> {
     let bearer = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -507,7 +517,7 @@ pub(crate) fn translate_turn_event(
                 None,
             )]
         }
-        TurnEvent::ToolCall { name, args } => {
+        TurnEvent::ToolCall { name, args, .. } => {
             let idx = *tool_call_index;
             *tool_call_index += 1;
             let call_id = format!("call_{}", uuid::Uuid::new_v4().simple());
@@ -528,7 +538,7 @@ pub(crate) fn translate_turn_event(
                 None,
             )]
         }
-        TurnEvent::ToolResult { name, output } => {
+        TurnEvent::ToolResult { name, output, .. } => {
             // OpenAI SSE has no native "tool result in stream". We emit a
             // non-standard `tool_result` field; strict clients ignore it.
             vec![build_chunk(
@@ -540,6 +550,7 @@ pub(crate) fn translate_turn_event(
                 None,
             )]
         }
+        TurnEvent::ApprovalRequest { .. } | TurnEvent::Usage { .. } => Vec::new(),
     }
 }
 
@@ -553,7 +564,9 @@ mod tests {
     fn chunk_event_emits_content_delta() {
         let mut idx = 0;
         let frames = translate_turn_event(
-            TurnEvent::Chunk { delta: "hi".to_string() },
+            TurnEvent::Chunk {
+                delta: "hi".to_string(),
+            },
             "chatcmpl-test",
             "m",
             &mut idx,
@@ -567,7 +580,9 @@ mod tests {
     fn thinking_event_emits_reasoning_field() {
         let mut idx = 0;
         let frames = translate_turn_event(
-            TurnEvent::Thinking { delta: "pondering".to_string() },
+            TurnEvent::Thinking {
+                delta: "pondering".to_string(),
+            },
             "chatcmpl-test",
             "m",
             &mut idx,
@@ -593,10 +608,12 @@ mod tests {
         assert_eq!(call["index"], 5);
         assert_eq!(call["type"], "function");
         assert_eq!(call["function"]["name"], "shell");
-        assert!(call["function"]["arguments"]
-            .as_str()
-            .unwrap()
-            .contains("echo hi"));
+        assert!(
+            call["function"]["arguments"]
+                .as_str()
+                .unwrap()
+                .contains("echo hi")
+        );
         assert_eq!(idx, 6, "tool call should advance index by 1");
     }
 
@@ -612,17 +629,20 @@ mod tests {
             "m",
             &mut idx,
         );
-        assert_eq!(frames[0]["choices"][0]["delta"]["tool_result"]["name"], "shell");
-        assert_eq!(frames[0]["choices"][0]["delta"]["tool_result"]["output"], "hi\n");
+        assert_eq!(
+            frames[0]["choices"][0]["delta"]["tool_result"]["name"],
+            "shell"
+        );
+        assert_eq!(
+            frames[0]["choices"][0]["delta"]["tool_result"]["output"],
+            "hi\n"
+        );
     }
 
     #[test]
     fn read_session_id_returns_some_when_header_present() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-aura-session-id",
-            "imsg_abc123def456".parse().unwrap(),
-        );
+        headers.insert("x-aura-session-id", "imsg_abc123def456".parse().unwrap());
         assert_eq!(
             read_session_id(&headers),
             Some("imsg_abc123def456".to_string())

@@ -2140,11 +2140,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..zeroclaw_config::schema::Config::default()
         };
-        let state = test_state_with_auth(
-            config,
-            Arc::new(PairingGuard::new(true, &[])),
-            None,
-        );
+        let state = test_state_with_auth(config, Arc::new(PairingGuard::new(true, &[])), None);
         let headers = bearer_headers("not-a-paired-token");
         let err = require_auth(&state, &headers)
             .expect_err("unpaired token without secret must be rejected");
@@ -2170,8 +2166,7 @@ mod tests {
         // No Authorization header at all
         let headers = HeaderMap::new();
 
-        let err =
-            require_auth(&state, &headers).expect_err("missing header must be rejected");
+        let err = require_auth(&state, &headers).expect_err("missing header must be rejected");
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
 

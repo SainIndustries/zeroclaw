@@ -105,8 +105,7 @@ pub(crate) fn seed_channel_handles(
     count
 }
 use crate::cost::types::BudgetCheck;
-use crate::i18n::ToolDescriptions;
-use crate::observability::{self, LlmUsageAttribution, Observer, ObserverEvent, runtime_trace};
+use crate::observability::{self, LlmUsageAttribution, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
 use crate::tools::{self, Tool};

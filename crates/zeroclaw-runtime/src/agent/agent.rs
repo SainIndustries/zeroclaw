@@ -2044,6 +2044,7 @@ impl Agent {
                         error_message: None,
                         input_tokens: resp_input_tokens,
                         output_tokens: resp_output_tokens,
+                        usage_attribution: None,
                     });
                     resp
                 }
@@ -2057,6 +2058,7 @@ impl Agent {
                         error_message: Some(safe_error),
                         input_tokens: None,
                         output_tokens: None,
+                        usage_attribution: None,
                     });
                     return Err(err);
                 }
@@ -2483,6 +2485,7 @@ impl Agent {
                     error_message: Some("request cancelled by user".into()),
                     input_tokens: None,
                     output_tokens: None,
+                    usage_attribution: None,
                 });
                 return Err(StreamedTurnError {
                     error: crate::agent::loop_::ToolLoopCancelled.into(),
@@ -2512,6 +2515,7 @@ impl Agent {
                     error_message: Some(safe_error),
                     input_tokens: None,
                     output_tokens: None,
+                    usage_attribution: None,
                 });
                 return Err(StreamedTurnError {
                     error: anyhow::Error::msg(stream_error.unwrap_or_default()),
@@ -2593,6 +2597,7 @@ impl Agent {
                                 error_message: Some("request cancelled by user".into()),
                                 input_tokens: None,
                                 output_tokens: None,
+                            usage_attribution: None,
                             });
                             return Err(StreamedTurnError {
                                 error: crate::agent::loop_::ToolLoopCancelled.into(),
@@ -2617,6 +2622,7 @@ impl Agent {
                             error_message: Some(safe_error),
                             input_tokens: None,
                             output_tokens: None,
+                            usage_attribution: None,
                         });
                         if got_stream && !streamed_text.is_empty() {
                             let partial = Self::marked_partial_response(
@@ -2651,6 +2657,7 @@ impl Agent {
                 error_message: None,
                 input_tokens: resp_input_tokens,
                 output_tokens: resp_output_tokens,
+                usage_attribution: None,
             });
 
             // Forward per-call token usage so the WS gateway (and any other

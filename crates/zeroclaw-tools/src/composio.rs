@@ -645,8 +645,11 @@ impl Tool for ComposioTool {
         // Always use the server-configured default entity (from `[composio]` config.toml).
         // Prevents LLM-initiated privilege escalation via prompt-injected tool-call args.
         if args.get("entity_id").is_some() {
-            tracing::warn!(
-                tool = "composio",
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"tool": "composio"})),
                 "Ignoring LLM-supplied entity_id; using server-configured default"
             );
         }
