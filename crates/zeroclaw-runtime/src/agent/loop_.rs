@@ -194,11 +194,22 @@ pub fn clear_model_switch_request() {
     }
 }
 
-fn llm_usage_attribution(
+pub async fn scope_usage_attribution<F>(
+    usage_context: UsageAttributionContext,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    USAGE_ATTRIBUTION_CONTEXT
+        .scope(Some(usage_context), future)
+        .await
+}
+
+pub(crate) fn scoped_llm_usage_attribution(
     turn_id: &str,
     iteration: usize,
-    channel_name: &str,
-) -> LlmUsageAttribution {
+) -> Option<LlmUsageAttribution> {
     USAGE_ATTRIBUTION_CONTEXT
         .try_with(|context| {
             context.as_ref().map(|context| LlmUsageAttribution {
@@ -212,14 +223,21 @@ fn llm_usage_attribution(
         })
         .ok()
         .flatten()
-        .unwrap_or_else(|| LlmUsageAttribution {
-            turn_id: turn_id.to_string(),
-            iteration: u32::try_from(iteration + 1).unwrap_or(u32::MAX),
-            channel: channel_name.to_string(),
-            source: "zeroclaw_channel".to_string(),
-            cron_job_id: None,
-            cron_job_name: None,
-        })
+}
+
+fn llm_usage_attribution(
+    turn_id: &str,
+    iteration: usize,
+    channel_name: &str,
+) -> LlmUsageAttribution {
+    scoped_llm_usage_attribution(turn_id, iteration).unwrap_or_else(|| LlmUsageAttribution {
+        turn_id: turn_id.to_string(),
+        iteration: u32::try_from(iteration + 1).unwrap_or(u32::MAX),
+        channel: channel_name.to_string(),
+        source: "zeroclaw_channel".to_string(),
+        cron_job_id: None,
+        cron_job_name: None,
+    })
 }
 
 fn glob_match(pattern: &str, name: &str) -> bool {

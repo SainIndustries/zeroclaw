@@ -152,6 +152,34 @@ impl Observer for TeeObserver {
     }
 }
 
+struct AuraUsageTeeObserver {
+    primary: Box<dyn Observer>,
+    aura_usage: AuraUsageObserver,
+}
+
+impl Observer for AuraUsageTeeObserver {
+    fn record_event(&self, event: &ObserverEvent) {
+        self.primary.record_event(event);
+        self.aura_usage.record_event(event);
+    }
+
+    fn record_metric(&self, metric: &ObserverMetric) {
+        self.primary.record_metric(metric);
+    }
+
+    fn flush(&self) {
+        self.primary.flush();
+    }
+
+    fn name(&self) -> &str {
+        self.primary.name()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self.primary.as_any()
+    }
+}
+
 /// Factory: create the right observer from config
 pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     Box::new(TeeObserver {
@@ -238,7 +266,10 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
 
 fn create_observer_with_aura_usage(base: Box<dyn Observer>) -> Box<dyn Observer> {
     if let Some(aura_usage) = AuraUsageObserver::from_env() {
-        Box::new(MultiObserver::new(vec![base, Box::new(aura_usage)]))
+        Box::new(AuraUsageTeeObserver {
+            primary: base,
+            aura_usage,
+        })
     } else {
         base
     }
@@ -399,6 +430,28 @@ mod tests {
 
         fn as_any(&self) -> &dyn Any {
             self
+        }
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.old.as_ref() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
         }
     }
 
@@ -565,5 +618,30 @@ mod tests {
         // `as_any` must surface the primary observer so existing downcasts
         // (e.g. PrometheusObserver in /metrics) keep working through the tee.
         assert!(observer.as_any().downcast_ref::<LogObserver>().is_some());
+    }
+
+    #[cfg(feature = "observability-prometheus")]
+    #[test]
+    fn factory_observer_downcasts_to_prometheus_when_aura_usage_enabled() {
+        let _guard = HOOK_TEST_LOCK.lock();
+        clear_broadcast_hook();
+        let _api_url = EnvGuard::set("AURA_API_URL", "http://127.0.0.1:9");
+        let _agent_id = EnvGuard::set("AGENT_ID", "agent-test");
+        let _gateway_token = EnvGuard::set("GATEWAY_TOKEN", "token-test");
+
+        let cfg = ObservabilityConfig {
+            backend: "prometheus".into(),
+            ..ObservabilityConfig::default()
+        };
+        let observer = create_observer(&cfg);
+
+        assert_eq!(observer.name(), "prometheus");
+        assert!(
+            observer
+                .as_any()
+                .downcast_ref::<PrometheusObserver>()
+                .is_some(),
+            "Aura usage wrapping must not hide PrometheusObserver from /metrics"
+        );
     }
 }

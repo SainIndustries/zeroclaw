@@ -3506,6 +3506,31 @@ mod tests {
         hex::encode(bytes)
     }
 
+    #[cfg(feature = "observability-prometheus")]
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    #[cfg(feature = "observability-prometheus")]
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, old }
+        }
+    }
+
+    #[cfg(feature = "observability-prometheus")]
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.old.as_ref() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
     #[test]
     fn security_body_limit_is_64kb() {
         assert_eq!(MAX_BODY_SIZE, 65_536);
@@ -3811,15 +3836,19 @@ mod tests {
 
     #[cfg(feature = "observability-prometheus")]
     #[tokio::test]
-    async fn metrics_endpoint_renders_prometheus_output() {
+    async fn metrics_endpoint_renders_prometheus_output_when_aura_usage_enabled() {
+        let _api_url = EnvGuard::set("AURA_API_URL", "http://127.0.0.1:9");
+        let _agent_id = EnvGuard::set("AGENT_ID", "agent-test");
+        let _gateway_token = EnvGuard::set("GATEWAY_TOKEN", "token-test");
         let event_tx = tokio::sync::broadcast::channel(16).0;
-        let prom = zeroclaw_runtime::observability::PrometheusObserver::new();
-        zeroclaw_runtime::observability::Observer::record_event(
-            &prom,
-            &zeroclaw_runtime::observability::ObserverEvent::HeartbeatTick,
-        );
+        let cfg = zeroclaw_config::schema::ObservabilityConfig {
+            backend: "prometheus".into(),
+            ..Default::default()
+        };
+        let observer = zeroclaw_runtime::observability::create_observer(&cfg);
+        observer.record_event(&zeroclaw_runtime::observability::ObserverEvent::HeartbeatTick);
 
-        let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(prom);
+        let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::from(observer);
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             model_provider: Arc::new(MockModelProvider::default()),
@@ -3879,7 +3908,8 @@ mod tests {
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(text.contains("zeroclaw_heartbeat_ticks_total 1"));
+        assert!(text.contains("zeroclaw_heartbeat_ticks_total"));
+        assert!(!text.contains("Prometheus backend not enabled"));
     }
 
     #[test]

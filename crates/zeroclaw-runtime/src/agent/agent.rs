@@ -1960,8 +1960,9 @@ impl Agent {
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
         let effective_model = self.classify_model(user_message);
+        let turn_id = uuid::Uuid::new_v4().to_string();
 
-        for _ in 0..self.config.resolved.max_tool_iterations {
+        for iteration in 0..self.config.resolved.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let prepared_messages = self.prepare_provider_messages(&messages).await?;
 
@@ -2044,7 +2045,9 @@ impl Agent {
                         error_message: None,
                         input_tokens: resp_input_tokens,
                         output_tokens: resp_output_tokens,
-                        usage_attribution: None,
+                        usage_attribution: crate::agent::loop_::scoped_llm_usage_attribution(
+                            &turn_id, iteration,
+                        ),
                     });
                     resp
                 }
@@ -2208,11 +2211,12 @@ impl Agent {
             .await;
 
         let effective_model = self.classify_model(user_message);
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let turn_started_at = std::time::Instant::now();
         let mut committed_response = String::new();
 
         // ── Turn loop ──────────────────────────────────────────────────
-        for _ in 0..self.config.resolved.max_tool_iterations {
+        for iteration in 0..self.config.resolved.max_tool_iterations {
             // Early exit if the caller cancelled this turn (e.g. user abort)
             if cancel_token
                 .as_ref()
@@ -2657,7 +2661,9 @@ impl Agent {
                 error_message: None,
                 input_tokens: resp_input_tokens,
                 output_tokens: resp_output_tokens,
-                usage_attribution: None,
+                usage_attribution: crate::agent::loop_::scoped_llm_usage_attribution(
+                    &turn_id, iteration,
+                ),
             });
 
             // Forward per-call token usage so the WS gateway (and any other
@@ -3362,6 +3368,132 @@ mod tests {
             self
         }
         fn flush(&self) {}
+    }
+
+    fn test_none_memory() -> Arc<dyn Memory> {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        )
+    }
+
+    fn usage_response(text: &str) -> zeroclaw_providers::ChatResponse {
+        zeroclaw_providers::ChatResponse {
+            text: Some(text.to_string()),
+            tool_calls: vec![],
+            usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                input_tokens: Some(11),
+                output_tokens: Some(7),
+                cached_input_tokens: None,
+            }),
+            reasoning_content: None,
+        }
+    }
+
+    fn assert_openai_compat_usage_attribution(events: &[ObserverEvent]) {
+        let response = events
+            .iter()
+            .find_map(|event| {
+                if let ObserverEvent::LlmResponse {
+                    success: true,
+                    input_tokens,
+                    output_tokens,
+                    usage_attribution,
+                    ..
+                } = event
+                {
+                    Some((input_tokens, output_tokens, usage_attribution))
+                } else {
+                    None
+                }
+            })
+            .expect("successful LlmResponse should have been recorded");
+
+        assert_eq!(*response.0, Some(11));
+        assert_eq!(*response.1, Some(7));
+        let attribution = response
+            .2
+            .as_ref()
+            .expect("OpenAI compat scope should attach usage attribution");
+        assert_eq!(attribution.channel, "openai_compat");
+        assert_eq!(attribution.source, "aura_openai_compat");
+        assert_eq!(attribution.iteration, 1);
+        assert!(attribution.cron_job_id.is_none());
+        assert!(attribution.cron_job_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn turn_records_scoped_openai_compat_usage_attribution() {
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![usage_response("done")]),
+        });
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(test_none_memory())
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let output = crate::agent::scope_usage_attribution(
+            crate::agent::UsageAttributionContext {
+                channel: "openai_compat".to_string(),
+                source: "aura_openai_compat".to_string(),
+                cron_job_id: None,
+                cron_job_name: None,
+            },
+            agent.turn("hello from openai compat"),
+        )
+        .await
+        .expect("turn should complete");
+
+        assert_eq!(output, "done");
+        assert_openai_compat_usage_attribution(&capturing.events.lock());
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_records_scoped_openai_compat_usage_attribution() {
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![usage_response("streamed done")]),
+        });
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(test_none_memory())
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let drainer =
+            zeroclaw_spawn::spawn!(async move { while event_rx.recv().await.is_some() {} });
+        let output = crate::agent::scope_usage_attribution(
+            crate::agent::UsageAttributionContext {
+                channel: "openai_compat".to_string(),
+                source: "aura_openai_compat".to_string(),
+                cron_job_id: None,
+                cron_job_name: None,
+            },
+            agent.turn_streamed("hello from streaming openai compat", event_tx, None),
+        )
+        .await
+        .expect("streamed turn should complete");
+
+        drainer.await.expect("event drainer should finish");
+        assert_eq!(output.0, "streamed done");
+        assert_openai_compat_usage_attribution(&capturing.events.lock());
     }
 
     struct MultimodalCaptureProvider {

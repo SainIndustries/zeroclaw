@@ -60,4 +60,7 @@ mod tests;
 #[allow(unused_imports)]
 pub use agent::{Agent, AgentBuilder, TurnEvent};
 #[allow(unused_imports)]
-pub use loop_::{UsageAttributionContext, process_message, run, run_with_usage_attribution};
+pub use loop_::{
+    UsageAttributionContext, process_message, run, run_with_usage_attribution,
+    scope_usage_attribution,
+};

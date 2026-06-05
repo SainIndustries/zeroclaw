@@ -32,6 +32,15 @@ fn default_agent_alias(config: &zeroclaw_config::schema::Config) -> Result<Strin
         .ok_or_else(|| "no configured agents available".to_string())
 }
 
+fn openai_usage_context() -> zeroclaw_runtime::agent::UsageAttributionContext {
+    zeroclaw_runtime::agent::UsageAttributionContext {
+        channel: "openai_compat".to_string(),
+        source: "aura_openai_compat".to_string(),
+        cron_job_id: None,
+        cron_job_name: None,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -219,7 +228,11 @@ pub async fn handle_chat_completions(
         // (one channel partner = one in-flight request at a time). If we
         // ever observe interleaved turns on the same session in production,
         // add session_queue.acquire(&session_key).await before turn_streamed.
-        let result = agent.turn_streamed(&user_message_drv, evt_tx, None).await;
+        let result = zeroclaw_runtime::agent::scope_usage_attribution(
+            openai_usage_context(),
+            agent.turn_streamed(&user_message_drv, evt_tx, None),
+        )
+        .await;
 
         // Wait for the forwarder to fully drain queued TurnEvents into
         // out_tx before we emit finish + [DONE]. Without this join, the
@@ -345,7 +358,12 @@ async fn handle_non_streaming(
     // (one channel partner = one in-flight request at a time). If we
     // ever observe interleaved turns on the same session in production,
     // add session_queue.acquire(&session_key).await before agent.turn.
-    let response_text = agent.turn(&user_message).await.map_err(|e| {
+    let response_text = zeroclaw_runtime::agent::scope_usage_attribution(
+        openai_usage_context(),
+        agent.turn(&user_message),
+    )
+    .await
+    .map_err(|e| {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
