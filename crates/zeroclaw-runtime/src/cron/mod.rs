@@ -16,7 +16,7 @@ pub use schedule::{
 pub use store::{
     add_agent_job, all_overdue_jobs, claim_all_overdue_jobs, claim_due_jobs, due_jobs, get_job,
     list_jobs, list_runs, record_last_run, record_run, remove_job, reschedule_after_run,
-    sync_declarative_jobs, update_job,
+    reserve_delivery, sync_declarative_jobs, update_job,
 };
 pub use types::{
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,

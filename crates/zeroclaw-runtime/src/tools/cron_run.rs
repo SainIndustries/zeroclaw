@@ -123,18 +123,63 @@ impl Tool for CronRunTool {
         if job.delivery.mode.eq_ignore_ascii_case("announce")
             && let (Some(channel), Some(target)) =
                 (job.delivery.channel.as_deref(), job.delivery.to.as_deref())
-            && let Err(e) =
-                cron::scheduler::deliver_announcement(&self.config, channel, target, &output).await
         {
-            if job.delivery.best_effort {
-                tracing::warn!(
+            let delivery_key =
+                cron::scheduler::cron_manual_delivery_key(&job, channel, target, &output);
+            match cron::reserve_delivery(
+                &self.config,
+                &delivery_key,
+                &job.id,
+                channel,
+                target,
+                &output,
+                Utc::now(),
+            ) {
+                Ok(false) => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        channel = %channel,
+                        target = %target,
+                        delivery_key = %delivery_key,
+                        "cron_run delivery skipped: duplicate delivery reservation"
+                    );
+                }
+                Ok(true) => {
+                    if let Err(e) = cron::scheduler::deliver_announcement(
+                        &self.config,
+                        channel,
+                        target,
+                        &output,
+                    )
+                    .await
+                    {
+                        if job.delivery.best_effort {
+                            tracing::warn!(
+                                job_id = %job.id,
+                                error = %e,
+                                "cron_run delivery failed (best_effort)"
+                            );
+                        } else {
+                            tracing::warn!(job_id = %job.id, error = %e, "cron_run delivery failed");
+                            success = false;
+                        }
+                    }
+                }
+                Err(e) if job.delivery.best_effort => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        error = %e,
+                        "cron_run delivery reservation failed (best_effort)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
                     job_id = %job.id,
                     error = %e,
-                    "cron_run delivery failed (best_effort)"
-                );
-            } else {
-                tracing::warn!(job_id = %job.id, error = %e, "cron_run delivery failed");
-                success = false;
+                        "cron_run delivery reservation failed"
+                    );
+                    success = false;
+                }
             }
         }
 
