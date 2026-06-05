@@ -597,6 +597,7 @@ mod tests {
         let mut idx = 5;
         let frames = translate_turn_event(
             TurnEvent::ToolCall {
+                id: "call-test".to_string(),
                 name: "shell".to_string(),
                 args: serde_json::json!({ "cmd": "echo hi" }),
             },
@@ -622,6 +623,7 @@ mod tests {
         let mut idx = 0;
         let frames = translate_turn_event(
             TurnEvent::ToolResult {
+                id: "call-test".to_string(),
                 name: "shell".to_string(),
                 output: "hi\n".to_string(),
             },

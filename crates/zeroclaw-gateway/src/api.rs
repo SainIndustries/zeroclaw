@@ -2101,7 +2101,7 @@ mod tests {
     fn require_auth_accepts_aura_internal_secret() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = zeroclaw_config::schema::Config {
-            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..zeroclaw_config::schema::Config::default()
         };
@@ -2118,7 +2118,7 @@ mod tests {
     fn require_auth_rejects_wrong_secret() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = zeroclaw_config::schema::Config {
-            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..zeroclaw_config::schema::Config::default()
         };
@@ -2136,7 +2136,7 @@ mod tests {
     fn require_auth_falls_through_to_paired_token_when_secret_unset() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = zeroclaw_config::schema::Config {
-            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..zeroclaw_config::schema::Config::default()
         };
@@ -2156,7 +2156,7 @@ mod tests {
         // even when a secret is configured.
         let tmp = tempfile::TempDir::new().unwrap();
         let config = zeroclaw_config::schema::Config {
-            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..zeroclaw_config::schema::Config::default()
         };

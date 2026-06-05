@@ -325,7 +325,7 @@ fn claim_overdue_jobs(
     let query = format!(
         "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                 enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                allowed_tools, source
+                allowed_tools, source, uses_memory, agent_alias
          FROM cron_jobs
          WHERE enabled = 1
            AND next_run <= ?1
@@ -1742,7 +1742,7 @@ mod tests {
     fn claim_due_jobs_leases_due_work_once() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
-        let job = add_job(&config, "* * * * *", "echo due").unwrap();
+        let job = add_job(&config, "test-agent", "* * * * *", "echo due").unwrap();
         let far_future = Utc::now() + ChronoDuration::days(365);
 
         let first_claim = claim_due_jobs(&config, far_future).unwrap();
@@ -1757,13 +1757,13 @@ mod tests {
     fn claim_due_jobs_allows_retry_after_lease_expiry() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
-        let job = add_job(&config, "* * * * *", "echo due").unwrap();
+        let job = add_job(&config, "test-agent", "* * * * *", "echo due").unwrap();
         let far_future = Utc::now() + ChronoDuration::days(365);
 
         let first_claim = claim_due_jobs(&config, far_future).unwrap();
         assert_eq!(first_claim.len(), 1);
 
-        with_connection(&config, |conn| {
+        with_initialized_connection(&config, |conn| {
             conn.execute(
                 "UPDATE cron_jobs SET claim_expires_at = ?1 WHERE id = ?2",
                 params![
@@ -1785,8 +1785,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.scheduler.max_tasks = 1;
-        let _ = add_job(&config, "* * * * *", "echo due-1").unwrap();
-        let _ = add_job(&config, "* * * * *", "echo due-2").unwrap();
+        let _ = add_job(&config, "test-agent", "* * * * *", "echo due-1").unwrap();
+        let _ = add_job(&config, "test-agent", "* * * * *", "echo due-2").unwrap();
         let far_future = Utc::now() + ChronoDuration::days(365);
 
         let claimed = claim_all_overdue_jobs(&config, far_future).unwrap();
@@ -1797,14 +1797,14 @@ mod tests {
     fn reschedule_after_run_clears_claim_lease() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
-        let job = add_job(&config, "*/15 * * * *", "echo run").unwrap();
+        let job = add_job(&config, "test-agent", "*/15 * * * *", "echo run").unwrap();
         let far_future = Utc::now() + ChronoDuration::days(365);
 
         let claimed = claim_due_jobs(&config, far_future).unwrap();
         assert_eq!(claimed.len(), 1);
         reschedule_after_run(&config, &claimed[0], true, "ok").unwrap();
 
-        let claim_state = with_connection(&config, |conn| {
+        let claim_state = with_initialized_connection(&config, |conn| {
             conn.query_row(
                 "SELECT claimed_at, claim_expires_at FROM cron_jobs WHERE id = ?1",
                 params![job.id],
