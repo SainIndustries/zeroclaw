@@ -52,7 +52,73 @@ pub struct ChatCompletionRequest {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    pub content: ChatMessageContent,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ChatMessageContent {
+    Text(String),
+    Parts(Vec<ChatContentPart>),
+}
+
+impl ChatMessageContent {
+    fn to_agent_text(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(ChatContentPart::to_agent_text_part)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum ChatContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrlPart },
+    #[serde(other)]
+    Unknown,
+}
+
+impl ChatContentPart {
+    fn to_agent_text_part(&self) -> Option<String> {
+        match self {
+            Self::Text { text } if !text.trim().is_empty() => Some(text.clone()),
+            Self::Text { .. } => None,
+            Self::ImageUrl { image_url } if !image_url.url.trim().is_empty() => {
+                Some(format!("[IMAGE:{}]", image_url.url))
+            }
+            Self::ImageUrl { .. } => None,
+            Self::Unknown => None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ImageUrlPart {
+    pub url: String,
+}
+
+const OMITTED_IMAGE_MARKER: &str = "[IMAGE:uploaded image omitted from history]";
+
+fn sanitize_user_message_for_history(message: &str) -> String {
+    message
+        .lines()
+        .map(|line| {
+            if line.starts_with("[IMAGE:data:") {
+                OMITTED_IMAGE_MARKER
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Internal SSE frame type emitted to the client.
@@ -97,7 +163,7 @@ pub async fn handle_chat_completions(
         .messages
         .iter()
         .rfind(|m| m.role == "user")
-        .map(|m| m.content.clone())
+        .map(|m| m.content.to_agent_text())
         .ok_or((
             StatusCode::BAD_REQUEST,
             "no user message found in messages".to_string(),
@@ -271,8 +337,9 @@ pub async fn handle_chat_completions(
             if let (Some(backend), Some(key)) =
                 (state.session_backend.as_ref(), session_key_drv.as_ref())
             {
-                let user_msg =
-                    zeroclaw_api::model_provider::ChatMessage::user(user_message_drv.clone());
+                let user_msg = zeroclaw_api::model_provider::ChatMessage::user(
+                    sanitize_user_message_for_history(&user_message_drv),
+                );
                 if let Err(e) = backend.append(key, &user_msg) {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -378,7 +445,9 @@ async fn handle_non_streaming(
     })?;
 
     if let (Some(backend), Some(key)) = (state.session_backend.as_ref(), session_key.as_ref()) {
-        let user_msg = zeroclaw_api::model_provider::ChatMessage::user(user_message.clone());
+        let user_msg = zeroclaw_api::model_provider::ChatMessage::user(
+            sanitize_user_message_for_history(&user_message),
+        );
         if let Err(e) = backend.append(key, &user_msg) {
             ::zeroclaw_log::record!(
                 WARN,
@@ -577,6 +646,66 @@ mod tests {
     use super::*;
     use axum::http::HeaderMap;
     use zeroclaw_runtime::agent::TurnEvent;
+
+    #[test]
+    fn chat_message_content_accepts_openai_multimodal_parts() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "us.anthropic.claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "How many calories is this?" },
+                    {
+                        "type": "image_url",
+                        "image_url": { "url": "data:image/png;base64,abc123" }
+                    }
+                ]
+            }]
+        }))
+        .expect("OpenAI-compatible multimodal request should deserialize");
+
+        assert_eq!(
+            req.messages[0].content.to_agent_text(),
+            "How many calories is this?\n[IMAGE:data:image/png;base64,abc123]"
+        );
+    }
+
+    #[test]
+    fn chat_message_content_ignores_unknown_multimodal_parts() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "us.anthropic.claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "Please inspect this." },
+                    { "type": "input_audio", "input_audio": { "data": "abc123", "format": "wav" } }
+                ]
+            }]
+        }))
+        .expect("Unknown OpenAI-compatible content parts should not reject the request");
+
+        assert_eq!(
+            req.messages[0].content.to_agent_text(),
+            "Please inspect this."
+        );
+    }
+
+    #[test]
+    fn sanitize_user_message_for_history_omits_data_url_images() {
+        let message = "How many calories?\n[IMAGE:data:image/jpeg;base64,abc123]\nThanks";
+
+        assert_eq!(
+            sanitize_user_message_for_history(message),
+            "How many calories?\n[IMAGE:uploaded image omitted from history]\nThanks"
+        );
+    }
+
+    #[test]
+    fn sanitize_user_message_for_history_preserves_non_data_image_refs() {
+        let message = "What is this?\n[IMAGE:https://example.com/photo.jpg]";
+
+        assert_eq!(sanitize_user_message_for_history(message), message);
+    }
 
     #[test]
     fn chunk_event_emits_content_delta() {
