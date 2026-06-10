@@ -8,7 +8,7 @@
 //! This module replaces the raw TCP implementation with axum for:
 //! - Proper HTTP/1.1 parsing and compliance
 //! - Content-Length validation (handled by hyper)
-//! - Request body size limits (64KB max)
+//! - Request body size limits (64KB default; larger for chat completions)
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
@@ -55,7 +55,7 @@ use axum::body::Bytes;
 use axum::extract::Query;
 use axum::{
     Router,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
     routing::{delete, get, post},
@@ -98,8 +98,10 @@ use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq, is_pub
 use zeroclaw_runtime::tools;
 use zeroclaw_runtime::tools::CanvasStore;
 
-/// Maximum request body size (64KB) — prevents memory exhaustion
+/// Default maximum request body size (64KB) — prevents memory exhaustion on normal routes.
 pub const MAX_BODY_SIZE: usize = 65_536;
+/// Maximum request body size for OpenAI-compatible chat completions.
+pub const CHAT_COMPLETIONS_MAX_BODY_SIZE: usize = 6 * 1024 * 1024;
 /// Default request timeout (30s) — prevents slow-loris attacks.
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 
@@ -1680,13 +1682,23 @@ pub async fn run_gateway(
         get(api_plugins::plugin_routes::list_plugins),
     );
 
-    // ── Streaming routes — no request timeout (turns can run for minutes) ──
-    let slow_routes = Router::new()
-        // ── OpenAI-compatible chat completions (for Aura webapp + OpenAI SDK clients) ──
+    // ── OpenAI-compatible chat completions (for Aura webapp + OpenAI SDK clients) ──
+    // This route accepts inline image data URLs from Aura SMS/iMessage, so it
+    // gets a larger request limit than the rest of the gateway.
+    let chat_completion_routes = Router::new()
         .route(
             "/v1/chat/completions",
             post(openai_compat::handle_chat_completions),
         )
+        .with_state(state.clone())
+        // Axum's `Json` extractor has its own 2MB default body limit. Raise it
+        // only here so inline SMS/iMessage image data URLs can reach the
+        // OpenAI-compatible handler while normal routes keep the smaller limit.
+        .layer(DefaultBodyLimit::max(CHAT_COMPLETIONS_MAX_BODY_SIZE))
+        .layer(RequestBodyLimitLayer::new(CHAT_COMPLETIONS_MAX_BODY_SIZE));
+
+    // ── Streaming routes — no request timeout (turns can run for minutes) ──
+    let slow_routes = Router::new()
         // ── ACP client bridge ──
         .route("/acp", get(acp::handle_ws_acp))
         // ── WebSocket agent chat ──
@@ -1727,7 +1739,10 @@ pub async fn run_gateway(
             Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
         ));
 
-    let inner = fast_routes.merge(slow_routes).merge(cron_run_router);
+    let inner = fast_routes
+        .merge(chat_completion_routes)
+        .merge(slow_routes)
+        .merge(cron_run_router);
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
@@ -3532,8 +3547,14 @@ mod tests {
     }
 
     #[test]
-    fn security_body_limit_is_64kb() {
+    fn security_body_limit_is_64kb_by_default() {
         assert_eq!(MAX_BODY_SIZE, 65_536);
+    }
+
+    #[test]
+    fn chat_completions_body_limit_allows_inline_images() {
+        assert_eq!(CHAT_COMPLETIONS_MAX_BODY_SIZE, 6 * 1024 * 1024);
+        assert!(CHAT_COMPLETIONS_MAX_BODY_SIZE > 2 * 1024 * 1024);
     }
 
     #[test]
