@@ -1493,7 +1493,14 @@ pub async fn handle_api_session_messages(
     } else {
         format!("gw_{id}")
     };
-    let msgs = backend.load_with_timestamps(&session_key);
+    let mut msgs = backend.load_with_timestamps(&session_key);
+    // Underscore-bearing ids are ambiguous: channel keys (`discord.x_y`)
+    // are stored verbatim, but gateway session ids (`imsg_…`, `dash_…`)
+    // are stored under `gw_<id>`. When the verbatim lookup is empty, fall
+    // back to the gw_-prefixed key so bare gateway ids still resolve.
+    if msgs.is_empty() && !id.starts_with("gw_") && session_key == id {
+        msgs = backend.load_with_timestamps(&format!("gw_{id}"));
+    }
     let messages: Vec<serde_json::Value> = msgs
         .into_iter()
         .map(|m| {

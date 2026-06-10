@@ -364,6 +364,11 @@ pub async fn handle_chat_completions(
                         "openai_compat: failed to persist assistant message"
                     );
                 }
+                // Stamp the agent alias (mirrors ws.rs) so /api/sessions can
+                // attribute this session. Unstamped sessions have neither
+                // agent_alias nor channel_id and are filtered out of the
+                // listing as pre-migration orphans.
+                let _ = backend.set_session_agent_alias(key, &agent_alias);
                 // Note: backend.set_session_state is intentionally NOT called here.
                 // Aura tracks turn state (idle/running/error) in its own webapp DB
                 // for UI indicators; the gateway-side session_state column is left
@@ -472,6 +477,11 @@ async fn handle_non_streaming(
                 "openai_compat (non-stream): failed to persist assistant message"
             );
         }
+        // Stamp the agent alias (mirrors ws.rs) so /api/sessions can
+        // attribute this session. Unstamped sessions have neither
+        // agent_alias nor channel_id and are filtered out of the
+        // listing as pre-migration orphans.
+        let _ = backend.set_session_agent_alias(key, &agent_alias);
         // Note: backend.set_session_state is intentionally NOT called here.
         // Aura tracks turn state (idle/running/error) in its own webapp DB
         // for UI indicators; the gateway-side session_state column is left
